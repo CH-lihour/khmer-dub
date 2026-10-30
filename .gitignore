@@ -1,0 +1,29 @@
+# Secrets: commit only the .env.example files
+.env
+**/.env
+.env.*
+**/.env.*
+!**/.env.example
+
+# Laravel
+web/vendor/
+web/node_modules/
+web/storage/app/
+
+# Worker
+worker/jobs/
+__pycache__/
+.pytest_cache/
+
+# Windows copy artifacts
+*:Zone.Identifier
+
+# Media and models never go in Git
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.srt
+*.bin
+*.safetensors

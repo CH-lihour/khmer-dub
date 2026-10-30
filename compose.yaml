@@ -1,0 +1,101 @@
+name: khmer-dub
+
+x-web-build: &web-build
+  context: ./web
+  args:
+    UID: ${UID:-1000}
+    GID: ${GID:-1000}
+
+services:
+  web:
+    build: *web-build
+    image: khmer-dub-web:dev
+    env_file: ./web/.env
+    environment:
+      DB_HOST: mysql
+      DUBBER_URL: http://worker:8001
+    volumes:
+      - ./web:/var/www/html
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/up"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  queue:
+    build: *web-build
+    image: khmer-dub-web:dev
+    # On a fresh database, wait for `php artisan migrate` instead of crash-looping.
+    command:
+      - sh
+      - -c
+      - |
+        until php artisan migrate:status > /dev/null 2>&1; do
+          echo "queue: waiting for php artisan migrate"; sleep 10
+        done
+        exec php artisan queue:work --timeout=3700 --tries=1
+    env_file: ./web/.env
+    environment:
+      DB_HOST: mysql
+      DUBBER_URL: http://worker:8001
+    volumes:
+      - ./web:/var/www/html
+    depends_on:
+      mysql:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    healthcheck:
+      # Healthy once PID 1 has become the queue worker; if it dies the container stops.
+      test: ["CMD", "sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline | grep -q '^php artisan queue:work'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:9.7.4 # latest LTS when built
+    env_file: ./web/.env
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot --password=\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: khmer-dub-worker:dev
+    env_file: ./worker/.env
+    volumes:
+      - ./worker:/app
+      - worker_jobs:/data/jobs
+      - hf_cache:/data/hf
+    # No ports: only web and queue reach it, at http://worker:8001.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  worker_jobs:
+  hf_cache:
