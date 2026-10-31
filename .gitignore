@@ -5,6 +5,9 @@
 **/.env.*
 !**/.env.example
 
+# Personal Compose tweaks (e.g. MySQL port for a GUI client)
+compose.override.yaml
+
 # Laravel
 web/vendor/
 web/node_modules/

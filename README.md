@@ -7,7 +7,8 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 0 (Docker setup). The upload page and the AI pipeline are not built yet.
+> Status: Phase 1 (audio extraction and transcription, as a command-line script).
+> Translation, voice, the worker API and the upload page are not built yet.
 
 ## Requirements
 
@@ -51,6 +52,28 @@ docker compose down                           # stop; volumes (models, database)
 
 Run every worker script and test through `docker compose run --rm worker ...`, never with a local Python.
 
+## Worker tests
+
+```bash
+docker compose run --rm worker pytest                  # all tests
+docker compose run --rm worker pytest -m "not models"  # skip the tests that load AI models
+```
+
+The tests make their own short sample files with FFmpeg. The transcription test also needs an
+English voice sample, which it makes with edge-tts. That needs internet, so the test is skipped
+when you are offline. The first run downloads the Whisper model (about 480 MB for `small`) into
+the `hf_cache` volume. Later runs reuse it.
+
+## Try the stages from the command line
+
+`./worker` is mounted at `/app` in the worker container. Put test videos in `worker/samples/`.
+Video files are never committed.
+
+```bash
+# Phase 1: print the timed speech segments and the detected language
+docker compose run --rm worker python try_transcribe.py samples/test.mp4
+```
+
 ## Services
 
 | Service  | Image                         | Role                              | Port |
@@ -77,6 +100,8 @@ PyTorch 2.15.0 (CPU), FastAPI 0.162, faster-whisper 1.2.1, transformers 5.22.1.
 Python 3.14 is used because every package (torch, ctranslate2, sentencepiece, onnxruntime, av)
 has a 3.14 wheel. Image tags are pinned in the Dockerfiles and `compose.yaml`, Python packages
 in `worker/requirements.txt` (torch in `worker/Dockerfile`), PHP packages in `web/composer.lock`.
+faster-whisper 1.2.1 cannot open files with the pinned PyAV 19, so `stages/transcribe.py` reads
+the 16 kHz WAV itself and passes Whisper the samples.
 
 ## Licenses (all free for personal and student use)
 
@@ -99,5 +124,8 @@ in `worker/requirements.txt` (torch in `worker/Dockerfile`), PHP packages in `we
 - `edge-tts` is unofficial and needs internet. It may change or stop working. Set `TTS_ENGINE=mms`
   for the fully offline (more robotic) voice.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
+- Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
+  noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate
+  but needs about twice the memory and time.
 - NLLB-200 and MMS-TTS weights are licensed for non-commercial use only.
 - Only use videos you own or may translate; label dubbed videos as AI-generated voice.
