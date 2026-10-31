@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 jobs/
+samples/
 **/__pycache__
 .pytest_cache
 *.mp4
