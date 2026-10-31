@@ -15,6 +15,7 @@ web/storage/app/
 
 # Worker
 worker/jobs/
+worker/samples/
 __pycache__/
 .pytest_cache/
 

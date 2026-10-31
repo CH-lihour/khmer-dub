@@ -1,11 +1,14 @@
 """Short sample files for the stage tests, generated once per test run with FFmpeg."""
 
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
 SPEECH_TEXT = "Hello and welcome. Today we are testing a tool that translates videos into Khmer."
+FIRST_SENTENCE = "Good morning. This is the first sentence of our short test."
+SECOND_SENTENCE = "After a long pause, here is the second sentence."
 SPEECH_DELAY_MS = 1500
 
 
@@ -51,15 +54,51 @@ def speech_video(samples: Path) -> Path:
 
     The voice is made with edge-tts, so this needs internet; tests that use it are skipped offline.
     """
-    import edge_tts
-
-    mp3 = samples / "speech.mp3"
-    try:
-        edge_tts.Communicate(SPEECH_TEXT, "en-US-AriaNeural").save_sync(str(mp3))
-    except Exception as exc:  # no network, or the unofficial service changed
-        pytest.skip(f"edge-tts is unreachable, so the speech sample cannot be made: {exc}")
-
+    mp3 = say(SPEECH_TEXT, samples / "speech.mp3")
     path = samples / "speech.mp4"
     ffmpeg("-f", "lavfi", "-i", "color=c=black:size=160x120:rate=10", "-i", str(mp3),
            "-af", f"adelay={SPEECH_DELAY_MS}:all=1", "-shortest", "-c:v", "mpeg4", "-c:a", "aac", str(path))
     return path
+
+
+@pytest.fixture(scope="session")
+def two_sentence_video(samples: Path) -> tuple[Path, tuple[float, float], tuple[float, float]]:
+    """MP4 with two English sentences 2.5 s apart after 1.5 s of silence, and when each is spoken.
+
+    The (start, end) times come from FFmpeg's silencedetect, which shares nothing with Whisper or
+    the Silero VAD, so tests can check the segment times against them. Needs internet (edge-tts).
+    """
+    first = say(FIRST_SENTENCE, samples / "first.mp3")
+    second = say(SECOND_SENTENCE, samples / "second.mp3")
+    wav = samples / "two_sentences.wav"
+    ffmpeg("-i", str(first), "-i", str(second), "-filter_complex",
+           f"[0:a]adelay={SPEECH_DELAY_MS}:all=1,apad=pad_dur=2.5[a];[a][1:a]concat=n=2:v=0:a=1,apad=pad_dur=1",
+           "-ac", "1", "-ar", "16000", str(wav))
+
+    spans = speech_spans(wav)
+    gap = max(range(len(spans) - 1), key=lambda i: spans[i + 1][0] - spans[i][1])  # the 2.5 s pause
+    path = samples / "two_sentences.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=black:size=160x120:rate=10", "-i", str(wav),
+           "-shortest", "-c:v", "mpeg4", "-c:a", "aac", str(path))
+    return path, (spans[0][0], spans[gap][1]), (spans[gap + 1][0], spans[-1][1])
+
+
+def say(text: str, mp3: Path) -> Path:
+    """Write English speech to `mp3` with edge-tts, or skip the test when it is unreachable."""
+    import edge_tts
+
+    try:
+        edge_tts.Communicate(text, "en-US-AriaNeural").save_sync(str(mp3))
+    except Exception as exc:  # no network, or the unofficial service changed
+        pytest.skip(f"edge-tts is unreachable, so the speech sample cannot be made: {exc}")
+    return mp3
+
+
+def speech_spans(wav: Path) -> list[tuple[float, float]]:
+    """Return the (start, end) seconds of sound between pauses of 0.3 s or more, using silencedetect."""
+    result = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-i", str(wav), "-af",
+                             "silencedetect=noise=-45dB:d=0.3", "-f", "null", "-"],
+                            check=True, capture_output=True, text=True)
+    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", result.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", result.stderr)]
+    return list(zip(ends, starts[1:]))  # the file starts and ends with silence

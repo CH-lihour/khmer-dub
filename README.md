@@ -7,8 +7,8 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 1 (audio extraction and transcription, as a command-line script).
-> Translation, voice, the worker API and the upload page are not built yet.
+> Status: Phase 2 (audio extraction, transcription and Khmer translation, as command-line scripts).
+> Voice, the worker API and the upload page are not built yet.
 
 ## Requirements
 
@@ -61,8 +61,9 @@ docker compose run --rm worker pytest -m "not models"  # skip the tests that loa
 
 The tests make their own short sample files with FFmpeg. The transcription test also needs an
 English voice sample, which it makes with edge-tts. That needs internet, so the test is skipped
-when you are offline. The first run downloads the Whisper model (about 480 MB for `small`) into
-the `hf_cache` volume. Later runs reuse it.
+when you are offline. The first run downloads the Whisper model (about 480 MB for `small`) and
+NLLB-200 (about 2.5 GB) into the `hf_cache` volume. Later runs reuse them. Neither model needs a
+Hugging Face account or token.
 
 ## Try the stages from the command line
 
@@ -72,7 +73,22 @@ Video files are never committed.
 ```bash
 # Phase 1: print the timed speech segments and the detected language
 docker compose run --rm worker python try_transcribe.py samples/test.mp4
+
+# Phase 2: print the original and the Khmer text of the first 20 segments
+docker compose run --rm worker python try_translate.py samples/test.mp4
+# ...or save them as worker/samples/review.txt for a Khmer speaker to rate
+docker compose run --rm -T worker python try_translate.py samples/test.mp4 > worker/samples/review.txt
 ```
+
+Segment times are fitted to the speech. Whisper's own times often start a line early (by up to
+2 s on the test clip) or let it run into the next one, so `stages/transcribe.py` does three things:
+it asks Whisper for word timestamps, splits a segment wherever two words are 1 s or more apart,
+and moves each edge onto the speech found by the Silero VAD (bundled with faster-whisper, MIT).
+
+Translation runs locally with NLLB-200 (`facebook/nllb-200-distilled-600M`, target `khm_Khmr`),
+12 segments per batch. The Whisper-to-NLLB language map is in `worker/stages/translate.py`.
+Khmer videos skip the model. Latin, Breton and Hawaiian are not supported, because Whisper can
+hear them but NLLB-200 cannot translate them.
 
 ## Services
 
@@ -121,11 +137,19 @@ the 16 kHz WAV itself and passes Whisper the samples.
 
 - Free translation (NLLB) is less natural than a paid LLM and can mistranslate names and numbers.
   Khmer output needs review by a Khmer speaker.
+- NLLB puts a space between every Khmer word, which normal Khmer writing does not do.
+- With plain beam search, NLLB can loop on short or list-like lines ("អ៊ូ! អ៊ូ! អ៊ូ! ...").
+  The worker blocks repeated 3-word sequences to stop this. As a side effect, it may reword a
+  phrase that really is said twice in one line.
+- CPU translation takes about 4 to 5 seconds per segment (37 s for the 8 segments of the 1 minute
+  test clip), longer than transcription.
 - `edge-tts` is unofficial and needs internet. It may change or stop working. Set `TTS_ENGINE=mms`
   for the fully offline (more robotic) voice.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
   noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate
   but needs about twice the memory and time.
+- Speech detection can miss quiet or crackly speech (old recordings, distant voices). Then a line's
+  end can be cut a little short, by up to about 0.5 s.
 - NLLB-200 and MMS-TTS weights are licensed for non-commercial use only.
 - Only use videos you own or may translate; label dubbed videos as AI-generated voice.
