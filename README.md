@@ -7,7 +7,7 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 2 (audio extraction, transcription and Khmer translation, as command-line scripts).
+> Status: Phase 3 (Khmer subtitles from a video, as command-line scripts).
 > Voice, the worker API and the upload page are not built yet.
 
 ## Requirements
@@ -78,7 +78,22 @@ docker compose run --rm worker python try_transcribe.py samples/test.mp4
 docker compose run --rm worker python try_translate.py samples/test.mp4
 # ...or save them as worker/samples/review.txt for a Khmer speaker to rate
 docker compose run --rm -T worker python try_translate.py samples/test.mp4 > worker/samples/review.txt
+
+# Phase 3: make Khmer subtitles; writes worker/samples/test-out/khmer.srt and segments.json
+docker compose run --rm worker python try_pipeline.py samples/test.mp4
 ```
+
+To check the subtitles in VLC:
+
+1. Open the video in VLC (on Windows, from
+   `\\wsl.localhost\ubuntu\home\<you>\projects\khmer-dub\worker\samples\`).
+2. Drag `test-out\khmer.srt` onto the VLC window, or use **Subtitle > Add Subtitle File...**.
+3. Check that each line appears when the speaker starts and disappears when they stop.
+4. If the Khmer shows as boxes, choose a Khmer font: **Tools > Preferences > Subtitles / OSD >
+   Font**, pick `Khmer UI` (included with Windows 10 and 11), save, and restart VLC.
+
+`khmer.srt` is plain UTF-8 and uses the original speech times. `segments.json` holds each
+segment's times with the original and Khmer text, for debugging and review.
 
 Segment times are fitted to the speech. Whisper's own times often start a line early (by up to
 2 s on the test clip) or let it run into the next one, so `stages/transcribe.py` does three things:
@@ -151,5 +166,7 @@ the 16 kHz WAV itself and passes Whisper the samples.
   but needs about twice the memory and time.
 - Speech detection can miss quiet or crackly speech (old recordings, distant voices). Then a line's
   end can be cut a little short, by up to about 0.5 s.
+- Subtitles keep the exact speech times. A very short line (0.5 s on the test clip) can disappear
+  before it is read, and a long one is shown as one line that the player wraps.
 - NLLB-200 and MMS-TTS weights are licensed for non-commercial use only.
 - Only use videos you own or may translate; label dubbed videos as AI-generated voice.
