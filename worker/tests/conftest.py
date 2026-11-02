@@ -17,6 +17,19 @@ def ffmpeg(*args: str) -> None:
     subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *args], check=True)
 
 
+def tone(path: Path, seconds: float, frequency: int = 440) -> str:
+    """Write a WAV 24 kHz mono tone (the clip format of Stage 4) and return its path as a string."""
+    ffmpeg("-f", "lavfi", "-i", f"sine=frequency={frequency}:duration={seconds}:sample_rate=24000",
+           "-ac", "1", "-c:a", "pcm_s16le", str(path))
+    return str(path)
+
+
+def probe(path: Path, *entries: str) -> list[str]:
+    """Return ffprobe's values for `-show_entries` items, one CSV line per stream or packet."""
+    args = ["ffprobe", "-v", "error", *entries, "-of", "csv=p=0", str(path)]
+    return subprocess.run(args, check=True, capture_output=True, text=True).stdout.split()
+
+
 @pytest.fixture(scope="session")
 def samples(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Folder that holds the generated samples."""

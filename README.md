@@ -7,8 +7,8 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 3 (Khmer subtitles from a video, as command-line scripts).
-> Voice, the worker API and the upload page are not built yet.
+> Status: Phase 4 (Khmer subtitles and a Khmer dubbed video, as command-line scripts).
+> The worker API and the upload page are not built yet.
 
 ## Requirements
 
@@ -95,6 +95,28 @@ To check the subtitles in VLC:
 `khmer.srt` is plain UTF-8 and uses the original speech times. `segments.json` holds each
 segment's times with the original and Khmer text, for debugging and review.
 
+```bash
+# Phase 4: also make worker/samples/test-out/dubbed.mp4 with a Khmer voice (female or male)
+docker compose run --rm worker python try_pipeline.py samples/test.mp4 --dub --voice female
+```
+
+The script prints how many clips were sped up, the fastest speed-up, any speech that had to be
+cut, and any clip that overlaps the next segment (there should be none).
+
+How the voice is made and fitted:
+
+- `TTS_ENGINE=edge` (default) uses edge-tts with `km-KH-SreymomNeural` (female) or
+  `km-KH-PisethNeural` (male). It needs internet and is retried twice. `TTS_ENGINE=mms` uses
+  `facebook/mms-tts-khm` offline (one voice, about 145 MB on the first run).
+- Each clip becomes WAV 24 kHz mono, and the silence around the speech is cut (edge-tts adds
+  about 0.2 s before and 0.8 s after).
+- A clip may run up to 25 % past its line's slot, but never past the next line's start. A longer
+  clip is sped up with FFmpeg `atempo`, at most x1.6, and never slowed down. If it still does not
+  fit, its end is cut with a short fade.
+- `dubbed.mp4` copies the picture (`-c:v copy`) and adds the Khmer track as AAC, tagged as an
+  AI-generated voice. MP4 cannot hold some WebM codecs (VP8, for example). Those videos are
+  re-encoded to H.264 instead, which is slower.
+
 Segment times are fitted to the speech. Whisper's own times often start a line early (by up to
 2 s on the test clip) or let it run into the next one, so `stages/transcribe.py` does three things:
 it asks Whisper for word timestamps, splits a segment wherever two words are 1 s or more apart,
@@ -159,7 +181,14 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - CPU translation takes about 4 to 5 seconds per segment (37 s for the 8 segments of the 1 minute
   test clip), longer than transcription.
 - `edge-tts` is unofficial and needs internet. It may change or stop working. Set `TTS_ENGINE=mms`
-  for the fully offline (more robotic) voice.
+  for the fully offline (more robotic) voice. It sometimes sends no audio for an ordinary
+  sentence. The worker retries, and the job fails with a message after three tries.
+- MMS-TTS cannot read digits or Latin letters, and NLLB writes numbers as Khmer digits
+  (`៥, ៤, ៣`), so with `mms` the numbers are silent.
+- The dubbed video has only the Khmer voice. The original music and sound effects are not kept.
+- Khmer is often longer than the original. A short line can lose the end of its speech even at
+  x1.6 (0.9 s of one 0.5 s line on the test clip), although the silence after it is free.
+- Making the voice takes about 2 seconds per line with edge-tts.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
   noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate

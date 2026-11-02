@@ -1,4 +1,4 @@
-"""Runs the stages for one job in order: audio, transcribe, translate, subtitles (then voice and mix)."""
+"""Runs the stages for one job in order: audio, transcribe, translate, subtitles, then voice and mix."""
 
 import json
 import logging
@@ -6,9 +6,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from stages.audio import extract_audio
-from stages.mix import write_srt
+from stages.mix import build_track, merge, write_srt
 from stages.transcribe import transcribe
 from stages.translate import translate
+from stages.tts import synth_all
 
 log = logging.getLogger(__name__)
 
@@ -20,17 +21,15 @@ def run(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, pro
 
     Reports the API contract's milestones through `progress(percent, message)`: 5 extract audio,
     15 transcribe, 45 translate, 60 voice, 85 mix and merge, 100 done. With dub=False it stops
-    after the SRT and "video" is None. `gender` picks the Khmer voice when dubbing. Stage
+    after the SRT and "video" is None. `gender` ("female" or "male") picks the Khmer voice. Stage
     failures raise StageError with a message the user can act on.
     """
-    if dub:
-        raise NotImplementedError("Dubbing (dub=True) is added in Phase 4")
     job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
     wav = job_dir / "audio.wav"
 
     progress(5, "Extracting audio")
-    extract_audio(video_path, wav)
+    duration = extract_audio(video_path, wav)
 
     progress(15, "Transcribing speech")
     segments, language = transcribe(wav)
@@ -39,9 +38,17 @@ def run(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, pro
     translate(segments, language)
     srt = job_dir / "khmer.srt"
     write_srt(segments, srt)
-    # Kept for debugging and review: the original and Khmer text of every segment with its times.
-    (job_dir / "segments.json").write_text(json.dumps(segments, ensure_ascii=False, indent=1), encoding="utf-8")
 
+    video = None
+    if dub:
+        progress(60, "Making the Khmer voice")
+        synth_all(segments, job_dir / "clips", gender)
+        progress(85, "Mixing and merging")
+        dub_wav = build_track(segments, round(duration * 1000), job_dir)
+        video = merge(video_path, dub_wav, job_dir / "dubbed.mp4")
+
+    # Kept for debugging and review: each segment's times, original and Khmer text, and voice timing.
+    (job_dir / "segments.json").write_text(json.dumps(segments, ensure_ascii=False, indent=1), encoding="utf-8")
     progress(100, "Done")
     log.info("Job %s done: %d segments from %s", job_dir.name, len(segments), language)
-    return {"language": language, "segments": len(segments), "srt": srt, "video": None}
+    return {"language": language, "segments": len(segments), "srt": srt, "video": video}
