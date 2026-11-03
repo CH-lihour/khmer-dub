@@ -22,6 +22,12 @@ def test_extracts_mono_16k_wav(tone_video: Path, tmp_path: Path) -> None:
         assert wav.getnframes() / wav.getframerate() == pytest.approx(2.0, abs=0.1)
 
 
+def test_check_video_returns_length_without_extracting(tone_video: Path, tmp_path: Path) -> None:
+    assert audio.check_video(tone_video) == pytest.approx(2.0, abs=0.1)
+    with pytest.raises(StageError, match="missing"):
+        audio.check_video(tmp_path / "nothing.mp4")
+
+
 def test_rejects_video_longer_than_limit(tone_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "MAX_VIDEO_MINUTES", 1 / 60)  # 1 second
     with pytest.raises(StageError, match="the limit is"):

@@ -7,8 +7,8 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 4 (Khmer subtitles and a Khmer dubbed video, as command-line scripts).
-> The worker API and the upload page are not built yet.
+> Status: Phase 5 (the worker API works and can be tested with curl from the `web` container).
+> The upload page is not built yet.
 
 ## Requirements
 
@@ -127,6 +127,60 @@ Translation runs locally with NLLB-200 (`facebook/nllb-200-distilled-600M`, targ
 Khmer videos skip the model. Latin, Breton and Hawaiian are not supported, because Whisper can
 hear them but NLLB-200 cannot translate them.
 
+## Worker API
+
+`worker/app.py` follows the API contract in `CLAUDE.md`. Every route except `GET /health`
+needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equal
+`DUBBER_TOKEN` (web/.env). An empty `WORKER_TOKEN` refuses every call.
+
+| Call | Answer |
+| --- | --- |
+| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`) | `{"job_id": "<32 hex>"}` |
+| `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language"}` |
+| `GET /jobs/{id}/download/srt` | `khmer.srt` |
+| `GET /jobs/{id}/download/video` | `dubbed.mp4` (only for `dub=true`) |
+| `GET /health` | `{"ok": true}` |
+
+- 401 for a wrong or missing token, 404 for an unknown job or a result that is not ready, 422 for
+  bad input. Every error has a readable `detail`. An upload is checked with ffprobe right away,
+  so a missing file, an unsupported or unreadable format, a video without sound, or one longer
+  than `MAX_VIDEO_MINUTES` is refused with 422 before it is queued. If FFmpeg itself is missing,
+  the answer is 500.
+- `language` is the detected spoken language as a Whisper code (for example `en`), or `null`
+  until the job is done. `error` is `null` unless the job failed.
+- `gender` defaults to `female` and `dub` to `true` when they are left out.
+- Jobs run one at a time on one worker thread, in upload order. Later uploads wait as `queued`.
+- Each job lives in `/data/jobs/<id>/` (the `worker_jobs` volume) with a `status.json`. After a
+  restart, finished jobs can still be downloaded. A job that was queued or running when the
+  worker stopped is marked `failed` and must be uploaded again.
+- When a job succeeds, the worker deletes its copy of the upload and its working files (audio,
+  voice clips). It keeps `khmer.srt`, `dubbed.mp4`, `segments.json` and `status.json`.
+- There is no `/docs` page. The worker port is not published, so test it from the `web`
+  container, which has `curl` and the token in `$DUBBER_TOKEN`:
+
+```bash
+# Put a test video where the web container can read it (./web is mounted at /var/www/html)
+mkdir -p web/storage/app/curl-test && cp worker/samples/test.webm web/storage/app/curl-test/
+
+# Health, no token needed
+docker compose exec web curl -sS http://worker:8001/health
+
+# Upload; keep the job id in $JOB
+JOB=$(docker compose exec -T web sh -c 'curl -sS -H "x-token: $DUBBER_TOKEN" -F file=@storage/app/curl-test/test.webm -F gender=female -F dub=true "$DUBBER_URL/jobs"' | sed -E 's/.*"job_id":"([0-9a-f]+)".*/\1/'); echo "$JOB"
+
+# Status; repeat until "status" is "done" (or "failed")
+docker compose exec -e JOB="$JOB" web sh -c 'curl -sS -H "x-token: $DUBBER_TOKEN" "$DUBBER_URL/jobs/$JOB"'
+
+# Download both results into web/storage/app/curl-test/
+docker compose exec -e JOB="$JOB" web sh -c 'curl -fsS -H "x-token: $DUBBER_TOKEN" -o storage/app/curl-test/khmer.srt "$DUBBER_URL/jobs/$JOB/download/srt"'
+docker compose exec -e JOB="$JOB" web sh -c 'curl -fsS -H "x-token: $DUBBER_TOKEN" -o storage/app/curl-test/dubbed.mp4 "$DUBBER_URL/jobs/$JOB/download/video"'
+
+# Error cases: no token (401), unknown job (404), wrong format (422)
+docker compose exec web curl -sS -w ' %{http_code}\n' http://worker:8001/jobs/abc
+docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBER_TOKEN" "$DUBBER_URL/jobs/abc"'
+docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBER_TOKEN" -F file=@composer.json "$DUBBER_URL/jobs"'
+```
+
 ## Services
 
 | Service  | Image                         | Role                              | Port |
@@ -190,6 +244,8 @@ the 16 kHz WAV itself and passes Whisper the samples.
   x1.6 (0.9 s of one 0.5 s line on the test clip), although the silence after it is free.
 - Making the voice takes about 2 seconds per line with edge-tts.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
+- The worker runs one job at a time, so an upload can wait in the queue behind a long video.
+  Restarting the worker fails the job that was running.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
   noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate
   but needs about twice the memory and time.

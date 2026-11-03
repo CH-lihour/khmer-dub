@@ -161,11 +161,11 @@ Both apps must follow this contract exactly. Every request to the worker carries
 | Method and path | Sends | Returns |
 | --- | --- | --- |
 | `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`) | `{"job_id": "<hex>"}` |
-| `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error"}` |
+| `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language"}` |
 | `GET /jobs/{id}/download/srt` | nothing | the .srt file |
 | `GET /jobs/{id}/download/video` | nothing | the dubbed .mp4 file |
 
-**Status values**: `queued`, `processing`, `done`, `failed`. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason.
+**Status values**: `queued`, `processing`, `done`, `failed`. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the job is done; Laravel stores it in `video_jobs.language`.
 
 **Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 60 voice, 85 mix and merge, 100 done.
 

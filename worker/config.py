@@ -1,12 +1,12 @@
 """Worker settings, read from environment variables (worker/.env, loaded by Compose).
 
-Stages read these as `config.NAME` at call time, so tests can override them with monkeypatch.
+The stages and app.py read these as `config.NAME` at call time, so tests can override them with monkeypatch.
 """
 
 import os
 from pathlib import Path
 
-WORKER_TOKEN: str = os.environ.get("WORKER_TOKEN", "")
+WORKER_TOKEN: str = os.environ.get("WORKER_TOKEN", "").strip()  # empty refuses every API call
 WHISPER_MODEL: str = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_DEVICE: str = os.environ.get("WHISPER_DEVICE", "cpu")
 TTS_ENGINE: str = os.environ.get("TTS_ENGINE", "edge")
