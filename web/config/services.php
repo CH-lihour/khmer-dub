@@ -28,6 +28,12 @@ return [
         'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
     ],
 
+    // The FastAPI dubbing worker. DUBBER_TOKEN must equal WORKER_TOKEN in worker/.env.
+    'dubber' => [
+        'url' => env('DUBBER_URL', 'http://worker:8001'),
+        'token' => env('DUBBER_TOKEN'),
+    ],
+
     'slack' => [
         'notifications' => [
             'bot_user_oauth_token' => env('SLACK_BOT_USER_OAUTH_TOKEN'),

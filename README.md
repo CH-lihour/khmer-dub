@@ -7,8 +7,9 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 5 (the worker API works and can be tested with curl from the `web` container).
-> The upload page is not built yet.
+> Status: Phase 6 (upload a video at http://localhost:8000, watch its progress, download the
+> Khmer `.srt` and dubbed `.mp4`). There is no login yet, so everyone who can open the site
+> sees every job.
 
 ## Requirements
 
@@ -37,7 +38,8 @@ docker compose ps                             # wait until all four services are
 docker compose exec web php artisan migrate   # create tables
 ```
 
-Open http://localhost:8000. `APP_KEY` and `web/vendor/` are created automatically on the first start.
+Open http://localhost:8000 (it goes to the dubbing page at `/dub`). `APP_KEY` and `web/vendor/`
+are created automatically on the first start.
 
 ## Everyday commands
 
@@ -51,6 +53,17 @@ docker compose down                           # stop; volumes (models, database)
 ```
 
 Run every worker script and test through `docker compose run --rm worker ...`, never with a local Python.
+
+## Laravel tests
+
+```bash
+docker compose exec web php artisan test
+```
+
+They run on an in-memory SQLite database and a fake worker, so they never touch MySQL or the
+real worker. Compose passes `web/.env` to the container as real environment variables, so
+`web/phpunit.xml` forces every test setting in both `<env force="true">` and `<server>`, and
+`tests/TestCase.php` refuses to start on any database but in-memory SQLite.
 
 ## Worker tests
 
@@ -181,6 +194,42 @@ docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBE
 docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBER_TOKEN" -F file=@composer.json "$DUBBER_URL/jobs"'
 ```
 
+## Web app
+
+http://localhost:8000/dub has one page: a file input, a voice choice (female Sreymom or male
+Piseth), a "dubbed video" checkbox (unticked gives Khmer subtitles only), a progress bar that
+updates every 3 seconds, download links when the job is done, and the last 20 jobs.
+
+1. `POST /dub` checks the upload (MP4, MOV, MKV or WebM, at most 500 MB) and saves it under a
+   random name in `web/storage/app/private/uploads/`. It adds a row to `video_jobs` and queues
+   `ProcessVideoJob`.
+2. The `queue` service runs the job. It sends the video to the worker (`POST /jobs`), asks for its
+   status every 4 seconds and copies the progress, message and language into the row. It then
+   downloads the results into `web/storage/app/private/results/<id>/` (`khmer.srt`, and
+   `dubbed.mp4` when dubbing). Laravel 13 keeps its private files under
+   `storage/app/private/`, not `storage/app/`.
+3. The page reads `GET /dub/<id>/status` and offers `GET /dub/<id>/download/srt` and `/video`.
+   The downloads are named after the upload, for example `my-talk-khmer.mp4`.
+
+A failed job shows the reason: the worker's own message (no speech, too long, voice service
+unreachable, and so on), or a hint when the worker is down or the tokens differ. A job stops
+after one hour (`$timeout = 3600`) and is not retried (`$tries = 1`).
+
+`queue:work` keeps the code it started with. After changing PHP code or config, run
+`docker compose restart queue`. The `web` service picks up changes on the next request.
+
+**PHP upload limits.** `web/docker/php.ini` sets `upload_max_filesize = 512M` and
+`post_max_size = 520M`, which allow the 500 MB (512000 KB) the upload form accepts. To change them,
+edit that file, rebuild both images that use it, and check the values:
+
+```bash
+docker compose up -d --build web queue
+docker compose exec web php -r 'echo ini_get("upload_max_filesize"), " ", ini_get("post_max_size"), PHP_EOL;'
+```
+
+Keep `post_max_size` a little above `upload_max_filesize`, and change the `max:512000` rule in
+`web/app/Http/Controllers/VideoJobController.php` to match.
+
 ## Services
 
 | Service  | Image                         | Role                              | Port |
@@ -197,8 +246,6 @@ The worker port is never published; only `web` and `queue` reach it on the Compo
 Volumes: `mysql_data` (database), `worker_jobs` (`/data/jobs`), `hf_cache` (downloaded models).
 In development `./web` and `./worker` are bind-mounted into their containers, so code changes
 need no rebuild. Rebuild only after changing a Dockerfile or `requirements.txt`.
-
-PHP upload limits (512 MB) are set in `web/docker/php.ini`.
 
 ## Versions
 
@@ -246,6 +293,12 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
 - The worker runs one job at a time, so an upload can wait in the queue behind a long video.
   Restarting the worker fails the job that was running.
+- The page cannot show how far a large upload has got; it shows "Uploading" until the server has
+  the whole file. `php artisan serve` is a development server, and a slow upload can hold up the
+  page's other requests.
+- The Khmer labels and step messages on the page were written by AI and need review by a Khmer
+  speaker.
+- There is no login yet (Phase 7), so everyone who can open the site sees and downloads every job.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
   noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate
   but needs about twice the memory and time.
