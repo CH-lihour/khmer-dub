@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Jobs\ProcessVideoJob;
+use App\Models\User;
 use App\Models\VideoJob;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
@@ -12,7 +13,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 /**
- * VideoJobController: the page, the upload, the status JSON and the downloads.
+ * VideoJobController: the page, the upload, the status JSON, the downloads, and who may see them.
  */
 class DubPageTest extends TestCase
 {
@@ -20,21 +21,25 @@ class DubPageTest extends TestCase
 
     private const JSON = ['Accept' => 'application/json'];
 
+    private User $user;
+
     protected function setUp(): void
     {
         parent::setUp();
         Storage::fake('local');
         Queue::fake();
+        $this->user = User::factory()->create();
+        $this->actingAs($this->user);
     }
 
     /**
-     * Create a row with sensible defaults.
+     * Create a row owned by `$owner` (default: the signed-in user).
      *
      * @param  array<string, mixed>  $attributes
      */
-    private function makeJob(array $attributes = []): VideoJob
+    private function makeJob(array $attributes = [], ?User $owner = null): VideoJob
     {
-        return VideoJob::create(['original_name' => 'talk.mp4', 'path' => 'uploads/abc.mp4', ...$attributes]);
+        return ($owner ?? $this->user)->videoJobs()->create(['original_name' => 'talk.mp4', 'path' => 'uploads/abc.mp4', ...$attributes]);
     }
 
     public function test_home_redirects_to_the_dub_page(): void
@@ -42,12 +47,23 @@ class DubPageTest extends TestCase
         $this->get('/')->assertRedirect('/dub');
     }
 
-    public function test_page_shows_the_form_and_the_history(): void
+    public function test_guests_are_sent_to_the_login_page(): void
+    {
+        auth()->logout();
+        $job = $this->makeJob();
+
+        $this->get('/dub')->assertRedirect(route('login'));
+        $this->post('/dub', [])->assertRedirect(route('login'));
+        $this->get(route('dub.download', [$job, 'srt']))->assertRedirect(route('login'));
+        $this->getJson(route('dub.status', $job))->assertUnauthorized();
+    }
+
+    public function test_page_shows_the_form_and_the_users_history(): void
     {
         $job = $this->makeJob(['original_name' => 'old talk.mp4', 'status' => 'done', 'progress' => 100, 'srt_path' => 'results/1/khmer.srt']);
 
         $this->get('/dub')->assertOk()
-            ->assertSee('Khmer Dub')->assertSee('បញ្ចូលសំឡេងខ្មែរ')
+            ->assertSee('Khmer Dub')->assertSee('បញ្ចូលសំឡេងខ្មែរ')->assertSee($this->user->name)
             ->assertSee('name="video"', false)->assertSee('name="gender"', false)->assertSee('name="dub"', false)
             ->assertSee('old talk.mp4')
             ->assertSee(route('dub.download', [$job, 'srt']));
@@ -61,6 +77,25 @@ class DubPageTest extends TestCase
         $this->get('/dub')->assertOk()->assertViewHas('current', fn (array $current) => $current['id'] === $running->id);
     }
 
+    public function test_another_users_videos_are_not_listed_or_followed(): void
+    {
+        $other = $this->makeJob(['original_name' => 'someone else.mp4', 'status' => 'processing'], User::factory()->create());
+
+        $this->get('/dub')->assertOk()->assertDontSee('someone else.mp4')->assertViewHas('current', null);
+        $this->get("/dub?job={$other->id}")->assertOk()->assertDontSee('someone else.mp4')->assertViewHas('current', null);
+    }
+
+    public function test_another_users_status_and_downloads_are_forbidden(): void
+    {
+        $other = $this->makeJob(['status' => 'done', 'srt_path' => 'results/1/khmer.srt', 'video_path' => 'results/1/dubbed.mp4'], User::factory()->create());
+        Storage::disk('local')->put('results/1/khmer.srt', 'secret subtitles');
+        Storage::disk('local')->put('results/1/dubbed.mp4', 'secret video');
+
+        $this->getJson(route('dub.status', $other))->assertForbidden()->assertJson(['message' => 'This video belongs to another account.']);
+        $this->get(route('dub.download', [$other, 'srt']))->assertForbidden();
+        $this->get(route('dub.download', [$other, 'video']))->assertForbidden();
+    }
+
     public function test_upload_is_saved_under_a_random_name_and_queued(): void
     {
         $response = $this->post('/dub', [
@@ -71,6 +106,7 @@ class DubPageTest extends TestCase
 
         $job = VideoJob::sole();
         $response->assertCreated()->assertExactJson(['id' => $job->id, 'status_url' => route('dub.status', $job)]);
+        $this->assertSame($this->user->id, $job->user_id);
         $this->assertSame('My Holiday.mp4', $job->original_name);
         $this->assertMatchesRegularExpression('#^uploads/[A-Za-z0-9]{40}\.mp4$#', $job->path);
         Storage::disk('local')->assertExists($job->path);
@@ -169,5 +205,18 @@ class DubPageTest extends TestCase
         $this->get(route('dub.download', [$job, 'video']))->assertNotFound();
         $this->get("/dub/{$job->id}/download/audio")->assertNotFound();
         $this->get('/dub/999/status')->assertNotFound();
+    }
+
+    public function test_deleting_the_account_deletes_its_videos_and_files(): void
+    {
+        $job = $this->makeJob(['srt_path' => "results/{$this->user->id}/khmer.srt"]);
+        Storage::disk('local')->put($job->path, 'video');
+        Storage::disk('local')->put("{$job->resultsFolder()}/khmer.srt", 'subtitles');
+
+        $this->delete('/profile', ['password' => 'password'])->assertRedirect('/');
+
+        $this->assertModelMissing($job);
+        Storage::disk('local')->assertMissing($job->path);
+        Storage::disk('local')->assertMissing($job->resultsFolder());
     }
 }

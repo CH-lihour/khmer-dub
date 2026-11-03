@@ -4,10 +4,12 @@ The pipeline is replaced by quick fakes; the uploads are real sample videos chec
 """
 
 import json
+import os
 import re
 import threading
 import time
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -89,10 +91,12 @@ def test_health_needs_no_token() -> None:
     assert response.json() == {"ok": True}
 
 
-@pytest.mark.parametrize("path", ["/jobs", "/jobs/0123", "/jobs/0123/download/srt", "/jobs/0123/download/video", "/docs"])
+@pytest.mark.parametrize(
+    "path", ["/jobs", "/jobs/0123", "/jobs/0123/download/srt", "/jobs/0123/download/video", "/cleanup", "/docs"]
+)
 @pytest.mark.parametrize("headers", [{}, {"x-token": "wrong"}, {"x-token": ""}])
 def test_wrong_or_missing_token_is_401(client: TestClient, path: str, headers: dict) -> None:
-    method = client.post if path == "/jobs" else client.get
+    method = client.post if path in ("/jobs", "/cleanup") else client.get
     response = method(path, headers=headers)
     assert response.status_code == 401
     assert "x-token" in response.json()["detail"]
@@ -286,3 +290,62 @@ def test_jobs_survive_a_restart(work_dir: Path, runs: list[dict], tone_video: Pa
             "status": "failed", "progress": 45, "message": "Failed", "error": worker.RESTARTED, "language": None
         }
         assert client.get("/jobs/notes", headers=AUTH).status_code == 404
+
+
+def days_ago(days: float) -> str:
+    """An ISO time `days` days in the past, as stored in "created"."""
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def test_cleanup_deletes_only_old_finished_jobs(
+    client: TestClient, work_dir: Path, tone_video: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs = worker.app.state.jobs
+    old_done, new_done, old_running = (upload(client, tone_video).json()["job_id"] for _ in range(3))
+    for job_id in (old_done, new_done, old_running):
+        wait(client, job_id)
+    jobs.update(old_done, created=days_ago(8))
+    jobs.update(old_running, status="processing", created=days_ago(8))  # as if it were still running
+
+    def no_speech(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress) -> dict:
+        raise StageError("No speech was found in the video.")
+
+    monkeypatch.setattr(pipeline, "run", no_speech)
+    old_failed = upload(client, tone_video).json()["job_id"]
+    wait(client, old_failed)
+    jobs.update(old_failed, created=days_ago(10))
+
+    # Folders the worker has no state for: dated by their last change.
+    old_orphan, new_orphan, not_a_job = work_dir / ("b" * 32), work_dir / ("c" * 32), work_dir / "notes"
+    for folder in (old_orphan, new_orphan, not_a_job):
+        folder.mkdir()
+    eight_days = time.time() - 8 * 86400
+    for folder in (old_orphan, not_a_job):
+        os.utime(folder, (eight_days, eight_days))
+
+    response = client.post("/cleanup", headers=AUTH, data={"days": "7"})
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 3}
+    assert sorted(p.name for p in work_dir.iterdir()) == sorted([new_done, old_running, new_orphan.name, "notes"])
+    assert client.get(f"/jobs/{old_done}", headers=AUTH).status_code == 404
+    assert client.get(f"/jobs/{old_failed}", headers=AUTH).status_code == 404
+    assert client.get(f"/jobs/{new_done}/download/srt", headers=AUTH).status_code == 200
+    assert client.get(f"/jobs/{old_running}", headers=AUTH).json()["status"] == "processing"
+
+
+def test_cleanup_defaults_to_7_days(client: TestClient, tone_video: Path) -> None:
+    job_id = upload(client, tone_video).json()["job_id"]
+    wait(client, job_id)
+    worker.app.state.jobs.update(job_id, created=days_ago(6.9))
+
+    assert client.post("/cleanup", headers=AUTH).json() == {"deleted": 0}
+    worker.app.state.jobs.update(job_id, created=days_ago(7.1))
+    assert client.post("/cleanup", headers=AUTH).json() == {"deleted": 1}
+
+
+@pytest.mark.parametrize("days", ["0", "-1", "soon"])
+def test_cleanup_needs_a_positive_number_of_days(client: TestClient, days: str) -> None:
+    response = client.post("/cleanup", headers=AUTH, data={"days": days})
+    assert response.status_code == 422
+    assert "days" in response.json()["detail"]

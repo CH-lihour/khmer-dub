@@ -11,15 +11,15 @@ class DatabaseSeeder extends Seeder
     use WithoutModelEvents;
 
     /**
-     * Seed the application's database.
+     * Two development accounts, to check that one user cannot open another user's videos.
+     * Their password is the UserFactory default. Running the seeder again changes nothing.
      */
     public function run(): void
     {
-        // User::factory(10)->create();
-
-        User::factory()->create([
-            'name' => 'Test User',
-            'email' => 'test@example.com',
-        ]);
+        foreach (['test@example.com' => 'Test User', 'second@example.com' => 'Second User'] as $email => $name) {
+            if (! User::where('email', $email)->exists()) {
+                User::factory()->create(['name' => $name, 'email' => $email]);
+            }
+        }
     }
 }

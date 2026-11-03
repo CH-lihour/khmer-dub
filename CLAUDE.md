@@ -67,7 +67,7 @@ Use one Git repository with two separate apps in two folders. Each app keeps its
 khmer-dub/
   CLAUDE.md                  # this guideline
   README.md                  # setup and run instructions (keep updated)
-  compose.yaml               # services: web, queue, mysql, worker
+  compose.yaml               # services: web, queue, scheduler, mysql, worker
   .gitignore
   web/                       # Laravel app
     Dockerfile
@@ -123,6 +123,7 @@ Everything runs in containers. The developer needs only Git and Docker (Docker E
 | --- | --- | --- | --- |
 | `web` | PHP 8.5 CLI with Composer, built from `web/Dockerfile` | Laravel site (`php artisan serve --host=0.0.0.0`) | 8000 |
 | `queue` | same image as `web` | `php artisan queue:work --timeout=3700` | none |
+| `scheduler` | same image as `web` | `php artisan schedule:work` (runs `dub:cleanup` daily) | none |
 | `mysql` | official `mysql` image, latest LTS tag | database | none |
 | `worker` | official `python` slim image (3.14, or 3.13 if needed) plus FFmpeg | FastAPI worker | none |
 
@@ -164,6 +165,7 @@ Both apps must follow this contract exactly. Every request to the worker carries
 | `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language"}` |
 | `GET /jobs/{id}/download/srt` | nothing | the .srt file |
 | `GET /jobs/{id}/download/video` | nothing | the dubbed .mp4 file |
+| `POST /cleanup` | form: `days` (number above 0, default 7) | `{"deleted": <count>}` after deleting finished job folders created more than `days` days ago; queued and running jobs are kept |
 
 **Status values**: `queued`, `processing`, `done`, `failed`. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the job is done; Laravel stores it in `video_jobs.language`.
 

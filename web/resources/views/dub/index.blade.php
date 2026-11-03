@@ -20,77 +20,12 @@
     ];
     $statusLabel = ['queued' => 'Queued', 'processing' => 'Processing', 'done' => 'Done', 'failed' => 'Failed'];
 @endphp
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Khmer Dub</title>
-    <style>
-        :root {
-            --bg: #f6f5f2; --surface: #ffffff; --text: #1d1d1b; --muted: #66645e; --line: #dedbd3;
-            --accent: #1f5f8b; --accent-text: #ffffff; --bar: #e8e5de; --ok: #2d6a3e; --bad: #a3322a;
-            --bad-bg: #fbeceb;
-        }
-        @media (prefers-color-scheme: dark) {
-            :root {
-                --bg: #161615; --surface: #201f1d; --text: #ecebe7; --muted: #a29f97; --line: #3a3834;
-                --accent: #6fb0dc; --accent-text: #0f1a22; --bar: #34322e; --ok: #7cc28e; --bad: #f08a80;
-                --bad-bg: #3a2220;
-            }
-        }
-        * { box-sizing: border-box; }
-        body {
-            margin: 0; background: var(--bg); color: var(--text); line-height: 1.6;
-            font-family: system-ui, "Segoe UI", "Khmer UI", "Noto Sans Khmer", "Leelawadee UI", sans-serif;
-        }
-        main { max-width: 44rem; margin: 0 auto; padding: 2rem 1rem 3rem; }
-        h1 { font-size: 1.6rem; margin: 0; }
-        h2 { font-size: 1.1rem; margin: 0 0 .75rem; }
-        .km { color: var(--muted); }
-        .lead { margin: .25rem 0 1.5rem; color: var(--muted); }
-        .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem; }
-        label { display: block; font-weight: 600; margin-bottom: .25rem; }
-        .field { margin-bottom: 1rem; }
-        .hint { display: block; font-size: .875rem; color: var(--muted); font-weight: 400; }
-        input[type=file], select { width: 100%; font: inherit; color: inherit; padding: .5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
-        .check { display: flex; gap: .5rem; align-items: flex-start; font-weight: 600; }
-        .check input { margin-top: .4rem; }
-        button {
-            font: inherit; font-weight: 600; padding: .6rem 1.2rem; border: 0; border-radius: 6px;
-            background: var(--accent); color: var(--accent-text); cursor: pointer;
-        }
-        button:disabled { opacity: .6; cursor: progress; }
-        .errors { color: var(--bad); background: var(--bad-bg); border-radius: 6px; padding: .5rem .75rem; margin: 1rem 0 0; }
-        .errors:empty { display: none; }
-        .errors li { margin-left: 1rem; }
-        .bar { height: .75rem; background: var(--bar); border-radius: 99px; overflow: hidden; margin: .5rem 0; }
-        .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
-        .bar.done span { background: var(--ok); }
-        .bar.failed span { background: var(--bad); }
-        .row { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
-        .name { overflow-wrap: anywhere; }
-        .error { color: var(--bad); }
-        .links { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin-top: .75rem; }
-        .links a, td a { color: var(--accent); font-weight: 600; }
-        table { width: 100%; border-collapse: collapse; font-size: .925rem; }
-        th, td { text-align: left; padding: .5rem .5rem .5rem 0; border-top: 1px solid var(--line); vertical-align: top; }
-        th { color: var(--muted); font-weight: 600; border-top: 0; }
-        .s-done { color: var(--ok); } .s-failed { color: var(--bad); }
-        footer { font-size: .875rem; color: var(--muted); }
-        [hidden] { display: none !important; }
-        @media (max-width: 30rem) { .when { display: none; } }
-    </style>
-</head>
-<body>
-<main>
-    <header>
-        <h1>Khmer Dub <span class="km">· បញ្ចូលសំឡេងខ្មែរ</span></h1>
-        <p class="lead">
-            Upload a video in any language and get Khmer subtitles and a Khmer voice track.<br>
-            <span lang="km">ផ្ទុកវីដេអូជាភាសាណាមួយ ហើយទទួលបានអក្សររត់ និងសំឡេងជាភាសាខ្មែរ។</span>
-        </p>
-    </header>
+<x-app-layout>
+    <h1>Dub a video <span class="km">· បញ្ចូលសំឡេងវីដេអូ</span></h1>
+    <p class="lead">
+        Upload a video in any language and get Khmer subtitles and a Khmer voice track.<br>
+        <span lang="km">ផ្ទុកវីដេអូជាភាសាណាមួយ ហើយទទួលបានអក្សររត់ និងសំឡេងជាភាសាខ្មែរ។</span>
+    </p>
 
     <form id="upload" class="card" method="post" action="{{ route('dub.store') }}" enctype="multipart/form-data">
         @csrf
@@ -141,7 +76,7 @@
     </section>
 
     <section class="card">
-        <h2>History <span class="km">· ប្រវត្តិ</span></h2>
+        <h2>Your videos <span class="km">· វីដេអូរបស់អ្នក</span></h2>
         <table>
             <thead><tr><th>Video</th><th class="when">Started</th><th>Status</th><th>Results</th></tr></thead>
             <tbody id="history">
@@ -160,6 +95,7 @@
             @endforelse
             </tbody>
         </table>
+        <p class="hint">Videos and their results are deleted after 7 days · វីដេអូ និងលទ្ធផលត្រូវលុបចោលក្រោយ 7 ថ្ងៃ</p>
     </section>
 
     <footer>
@@ -168,121 +104,129 @@
         <p lang="km">ការបកប្រែ និងសំឡេង បង្កើតដោយ AI ឥតគិតថ្លៃ ហើយត្រូវការអ្នកនិយាយភាសាខ្មែរពិនិត្យមុនពេលប្រើ។
             សូមផ្ទុកតែវីដេអូដែលអ្នកជាម្ចាស់ ឬមានសិទ្ធិបកប្រែ ហើយបញ្ជាក់ថាវីដេអូនេះប្រើសំឡេង AI។</p>
     </footer>
-</main>
 
-<script>
-(() => {
-    const KM = @json($km);
-    const STATUS = @json($statusLabel);
-    const POLL_MS = 3000;
-    const $ = (id) => document.getElementById(id);
-    const form = $('upload'), start = $('start'), errors = $('errors');
-    let timer = null;
+    <x-slot name="scripts">
+    <script>
+    (() => {
+        const KM = @json($km);
+        const STATUS = @json($statusLabel);
+        const POLL_MS = 3000;
+        const SIGNED_OUT = 'You are signed out. Reload the page and log in again. · សូមចូលគណនីម្តងទៀត';
+        const $ = (id) => document.getElementById(id);
+        const form = $('upload'), start = $('start'), errors = $('errors');
+        let timer = null;
 
-    /** "English · Khmer" for a known step message, or the message as it came. */
-    const bilingual = (text) => (KM[text] ? `${text} · ${KM[text]}` : text || '');
+        /** "English · Khmer" for a known step message, or the message as it came. */
+        const bilingual = (text) => (KM[text] ? `${text} · ${KM[text]}` : text || '');
 
-    function showErrors(list) {
-        errors.replaceChildren(...list.map((text) => Object.assign(document.createElement('li'), { textContent: text })));
-    }
-
-    /** Draw a job (the JSON from the status route) in the progress card and in its history row. */
-    function render(job) {
-        $('job').hidden = false;
-        $('job-name').textContent = job.name;
-        $('job-percent').textContent = `${job.progress}%`;
-        const bar = $('job-bar');
-        bar.className = `bar ${job.status}`;
-        bar.setAttribute('aria-valuenow', job.progress);
-        bar.firstElementChild.style.width = `${job.progress}%`;
-        $('job-message').textContent = bilingual(job.message);
-        $('job-error').hidden = !job.error;
-        $('job-error').textContent = job.error || '';
-        $('job-language').hidden = !job.language_name;
-        $('job-language').querySelector('span').textContent = job.language_name || '';
-        for (const [id, url] of [['job-srt', job.srt_url], ['job-video', job.video_url]]) {
-            $(id).hidden = !url;
-            $(id).href = url || '#';
+        function showErrors(list) {
+            errors.replaceChildren(...list.map((text) => Object.assign(document.createElement('li'), { textContent: text })));
         }
-        if (job.id) renderRow(job);
-    }
 
-    function renderRow(job) {
-        let row = document.querySelector(`#history tr[data-id="${job.id}"]`);
-        if (!row) {
-            $('history-empty')?.remove();
-            row = document.createElement('tr');
-            row.dataset.id = job.id;
-            row.innerHTML = '<td class="name"><a></a></td><td class="when">just now</td><td class="status"></td><td class="results"></td>';
-            row.querySelector('a').textContent = job.name;
-            row.querySelector('a').href = `?job=${job.id}`;
-            $('history').prepend(row);
-        }
-        const status = row.querySelector('.status');
-        status.className = `status s-${job.status}`;
-        status.textContent = `${STATUS[job.status] || job.status} · ${KM[job.status] || ''}`;
-        const links = [[job.srt_url, 'SRT'], [job.video_url, 'MP4']].filter(([url]) => url)
-            .map(([url, text]) => Object.assign(document.createElement('a'), { href: url, textContent: text }));
-        row.querySelector('.results').replaceChildren(...links.flatMap((a) => [a, ' ']));
-    }
-
-    /** Ask for the job's status every 3 seconds until it is done or failed. */
-    async function poll(url) {
-        clearTimeout(timer);
-        try {
-            const response = await fetch(url, { headers: { Accept: 'application/json' } });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const job = await response.json();
-            render(job);
-            if (job.status === 'done' || job.status === 'failed') return;
-        } catch (error) {
-            $('job-message').textContent = 'Lost contact with the site, trying again… · កំពុងព្យាយាមម្តងទៀត';
-        }
-        timer = setTimeout(() => poll(url), POLL_MS);
-    }
-
-    form.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const file = $('video').files[0];
-        if (!file) return showErrors(['Choose a video file.']);
-        showErrors([]);
-        clearTimeout(timer);
-        start.disabled = true;
-        render({ name: file.name, status: 'queued', progress: 0, message: 'Uploading', error: null });
-        try {
-            const response = await fetch(form.action, { method: 'POST', body: new FormData(form), headers: { Accept: 'application/json' } });
-            if (response.status === 201) {
-                const { id, status_url: url } = await response.json();
-                history.replaceState(null, '', `?job=${id}`);
-                form.reset();
-                poll(url);
-                return;
+        /** Draw a job (the JSON from the status route) in the progress card and in its history row. */
+        function render(job) {
+            $('job').hidden = false;
+            $('job-name').textContent = job.name;
+            $('job-percent').textContent = `${job.progress}%`;
+            const bar = $('job-bar');
+            bar.className = `bar ${job.status}`;
+            bar.setAttribute('aria-valuenow', job.progress);
+            bar.firstElementChild.style.width = `${job.progress}%`;
+            $('job-message').textContent = bilingual(job.message);
+            $('job-error').hidden = !job.error;
+            $('job-error').textContent = job.error || '';
+            $('job-language').hidden = !job.language_name;
+            $('job-language').querySelector('span').textContent = job.language_name || '';
+            for (const [id, url] of [['job-srt', job.srt_url], ['job-video', job.video_url]]) {
+                $(id).hidden = !url;
+                $(id).href = url || '#';
             }
-            $('job').hidden = true;
-            if (response.status === 422) {
-                const body = await response.json();
-                showErrors(Object.values(body.errors || {}).flat());
-            } else if (response.status === 413) {
-                showErrors(['The video is larger than 500 MB.']);
-            } else if (response.status === 419) {
-                showErrors(['The page has expired. Reload it and try again.']);
-            } else {
-                showErrors([`The upload failed (HTTP ${response.status}). Please try again.`]);
-            }
-        } catch (error) {
-            $('job').hidden = true;
-            showErrors(['The site could not be reached. Check that it is running and try again.']);
-        } finally {
-            start.disabled = false;
+            if (job.id) renderRow(job);
         }
-    });
 
-    const current = @json($current);
-    if (current) {
-        render(current);
-        if (current.status !== 'done' && current.status !== 'failed') poll(current.status_url);
-    }
-})();
-</script>
-</body>
-</html>
+        function renderRow(job) {
+            let row = document.querySelector(`#history tr[data-id="${job.id}"]`);
+            if (!row) {
+                $('history-empty')?.remove();
+                row = document.createElement('tr');
+                row.dataset.id = job.id;
+                row.innerHTML = '<td class="name"><a></a></td><td class="when">just now</td><td class="status"></td><td class="results"></td>';
+                row.querySelector('a').textContent = job.name;
+                row.querySelector('a').href = `?job=${job.id}`;
+                $('history').prepend(row);
+            }
+            const status = row.querySelector('.status');
+            status.className = `status s-${job.status}`;
+            status.textContent = `${STATUS[job.status] || job.status} · ${KM[job.status] || ''}`;
+            const links = [[job.srt_url, 'SRT'], [job.video_url, 'MP4']].filter(([url]) => url)
+                .map(([url, text]) => Object.assign(document.createElement('a'), { href: url, textContent: text }));
+            row.querySelector('.results').replaceChildren(...links.flatMap((a) => [a, ' ']));
+        }
+
+        /** Ask for the job's status every 3 seconds until it is done or failed. */
+        async function poll(url) {
+            clearTimeout(timer);
+            try {
+                const response = await fetch(url, { headers: { Accept: 'application/json' } });
+                if (response.status === 401 || response.status === 403) {
+                    $('job-error').hidden = false;
+                    $('job-error').textContent = response.status === 401 ? SIGNED_OUT : 'This video belongs to another account.';
+                    return;
+                }
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const job = await response.json();
+                render(job);
+                if (job.status === 'done' || job.status === 'failed') return;
+            } catch (error) {
+                $('job-message').textContent = 'Lost contact with the site, trying again… · កំពុងព្យាយាមម្តងទៀត';
+            }
+            timer = setTimeout(() => poll(url), POLL_MS);
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const file = $('video').files[0];
+            if (!file) return showErrors(['Choose a video file.']);
+            showErrors([]);
+            clearTimeout(timer);
+            start.disabled = true;
+            render({ name: file.name, status: 'queued', progress: 0, message: 'Uploading', error: null });
+            try {
+                const response = await fetch(form.action, { method: 'POST', body: new FormData(form), headers: { Accept: 'application/json' } });
+                if (response.status === 201) {
+                    const { id, status_url: url } = await response.json();
+                    history.replaceState(null, '', `?job=${id}`);
+                    form.reset();
+                    poll(url);
+                    return;
+                }
+                $('job').hidden = true;
+                if (response.status === 422) {
+                    const body = await response.json();
+                    showErrors(Object.values(body.errors || {}).flat());
+                } else if (response.status === 413) {
+                    showErrors(['The video is larger than 500 MB.']);
+                } else if (response.status === 401) {
+                    showErrors([SIGNED_OUT]);
+                } else if (response.status === 419) {
+                    showErrors(['The page has expired. Reload it and try again.']);
+                } else {
+                    showErrors([`The upload failed (HTTP ${response.status}). Please try again.`]);
+                }
+            } catch (error) {
+                $('job').hidden = true;
+                showErrors(['The site could not be reached. Check that it is running and try again.']);
+            } finally {
+                start.disabled = false;
+            }
+        });
+
+        const current = @json($current);
+        if (current) {
+            render(current);
+            if (current.status !== 'done' && current.status !== 'failed') poll(current.status_url);
+        }
+    })();
+    </script>
+    </x-slot>
+</x-app-layout>

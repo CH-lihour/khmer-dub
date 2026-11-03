@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Locale;
 
@@ -54,7 +55,33 @@ class VideoJob extends Model
      */
     protected function casts(): array
     {
-        return ['dub' => 'boolean', 'progress' => 'integer'];
+        return ['user_id' => 'integer', 'dub' => 'boolean', 'progress' => 'integer'];
+    }
+
+    /**
+     * Whether `$user` uploaded this video.
+     */
+    public function isOwnedBy(User $user): bool
+    {
+        return $this->user_id === $user->id;
+    }
+
+    /**
+     * The folder on the local disk that holds this job's results.
+     */
+    public function resultsFolder(): string
+    {
+        return "results/{$this->id}";
+    }
+
+    /**
+     * Delete the upload and the results of this job from the local disk (not the row).
+     */
+    public function deleteFiles(): void
+    {
+        $disk = Storage::disk('local');
+        $disk->delete($this->path);
+        $disk->deleteDirectory($this->resultsFolder());
     }
 
     /**

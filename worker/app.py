@@ -4,6 +4,7 @@
     GET  /jobs/{id}                  -> {"status", "progress", "message", "error", "language"}
     GET  /jobs/{id}/download/srt     -> khmer.srt
     GET  /jobs/{id}/download/video   -> dubbed.mp4
+    POST /cleanup                    form days (default 7) -> {"deleted": <count>}
     GET  /health                     -> {"ok": true}, the only route without the x-token header
 
 Jobs run one at a time on a single worker thread. Each job has a folder WORK_DIR/<id>/ with a
@@ -21,7 +22,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -84,6 +85,26 @@ class JobStore:
         with self._lock:
             job = self._jobs[job_id] = {**self._jobs[job_id], **fields, "updated": _now()}
             _write_json(self.work_dir / job_id / "status.json", job)
+
+    def cleanup(self, days: float) -> list[str]:
+        """Delete the folders of finished jobs created more than `days` days ago; return their ids.
+
+        Queued and running jobs are never deleted. A folder without a known job (no readable
+        status.json) is dated by its last change, so an upload still being saved is kept.
+        """
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        deleted = []
+        for folder in sorted(self.work_dir.iterdir()):
+            if not (folder.is_dir() and JOB_ID.fullmatch(folder.name)):
+                continue
+            with self._lock:
+                job = self._jobs.get(folder.name)
+                if (job and job.get("status") in ("queued", "processing")) or _created(folder, job) > cutoff:
+                    continue
+                self._jobs.pop(folder.name, None)
+            shutil.rmtree(folder, ignore_errors=True)
+            deleted.append(folder.name)
+        return deleted
 
     def shutdown(self) -> None:
         """Drop the jobs still waiting; a running one finishes in the background."""
@@ -237,6 +258,14 @@ def download_video(job_id: str, request: Request) -> FileResponse:
     return _result(request, job_id, "video", "video/mp4")
 
 
+@app.post("/cleanup")
+def cleanup(request: Request, days: Annotated[float, Form(gt=0)] = 7) -> dict[str, int]:
+    """Delete finished jobs created more than `days` days ago (default 7) and return how many."""
+    deleted = request.app.state.jobs.cleanup(days)
+    log.info("Cleanup older than %g days deleted %d job folders", days, len(deleted))
+    return {"deleted": len(deleted)}
+
+
 def _find(request: Request, job_id: str) -> dict:
     """Return the job's state, or answer 404 for an unknown id."""
     job = request.app.state.jobs.get(job_id)
@@ -256,6 +285,14 @@ def _result(request: Request, job_id: str, kind: str, media_type: str) -> FileRe
     if not path.is_file():
         raise HTTPException(404, "The result file is no longer on the worker.")
     return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+def _created(folder: Path, job: dict | None) -> datetime:
+    """When a job was created: the "created" time in its state, or else its folder's last change."""
+    try:
+        return datetime.fromisoformat(job["created"])
+    except (TypeError, KeyError, ValueError):
+        return datetime.fromtimestamp(folder.stat().st_mtime, UTC)
 
 
 def _token_ok(given: str) -> bool:

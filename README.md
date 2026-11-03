@@ -7,9 +7,9 @@ on your own machine. See `CLAUDE.md` for the full specification and build phases
 - `web/`: Laravel 13 site (uploads, queue, progress, downloads)
 - `worker/`: FastAPI worker (FFmpeg, faster-whisper, NLLB-200, edge-tts / MMS-TTS)
 
-> Status: Phase 6 (upload a video at http://localhost:8000, watch its progress, download the
-> Khmer `.srt` and dubbed `.mp4`). There is no login yet, so everyone who can open the site
-> sees every job.
+> Status: all 8 phases are built. Register or log in at http://localhost:8000, upload a video,
+> watch its progress, and download the Khmer `.srt` and dubbed `.mp4`. Each user sees only
+> their own videos, and everything is deleted after 7 days.
 
 ## Requirements
 
@@ -34,12 +34,20 @@ cp worker/.env.example worker/.env
 # Set the same random value for DUBBER_TOKEN (web/.env) and WORKER_TOKEN (worker/.env),
 # and change the database passwords in web/.env. Example token: openssl rand -hex 24
 docker compose up --build -d                  # first build downloads ~1.5 GB
-docker compose ps                             # wait until all four services are "healthy"
+docker compose ps                             # wait until all five services are "healthy"
 docker compose exec web php artisan migrate   # create tables
 ```
 
-Open http://localhost:8000 (it goes to the dubbing page at `/dub`). `APP_KEY` and `web/vendor/`
-are created automatically on the first start.
+Open http://localhost:8000, click **Register**, and create an account. You then land on the
+dubbing page at `/dub`. `APP_KEY` and `web/vendor/` are created automatically on the first start.
+The first video takes longer, because the worker downloads the AI models (about 3.5 GB) then.
+
+For development you can also create two test accounts, `test@example.com` and
+`second@example.com`, whose password is the default in `web/database/factories/UserFactory.php`:
+
+```bash
+docker compose exec web php artisan db:seed
+```
 
 ## Everyday commands
 
@@ -49,6 +57,9 @@ docker compose exec web php artisan migrate   # create tables
 docker compose exec web php artisan test      # Laravel tests
 docker compose run --rm worker pytest         # worker tests
 docker compose logs -f worker                 # worker log
+docker compose logs -f queue                  # Laravel queue log (each video job)
+docker compose exec web php artisan dub:cleanup   # delete videos older than 7 days now
+docker compose restart queue                  # after changing PHP code (queue:work keeps old code)
 docker compose down                           # stop; volumes (models, database) are kept
 ```
 
@@ -152,6 +163,7 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 | `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language"}` |
 | `GET /jobs/{id}/download/srt` | `khmer.srt` |
 | `GET /jobs/{id}/download/video` | `dubbed.mp4` (only for `dub=true`) |
+| `POST /cleanup` (form `days`, default 7) | `{"deleted": <count>}` |
 | `GET /health` | `{"ok": true}` |
 
 - 401 for a wrong or missing token, 404 for an unknown job or a result that is not ready, 422 for
@@ -168,6 +180,9 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
   worker stopped is marked `failed` and must be uploaded again.
 - When a job succeeds, the worker deletes its copy of the upload and its working files (audio,
   voice clips). It keeps `khmer.srt`, `dubbed.mp4`, `segments.json` and `status.json`.
+- `POST /cleanup` deletes the folders of finished (done or failed) jobs created more than `days`
+  days ago, also ones Laravel never recorded. Queued and running jobs are never deleted.
+  Laravel's `dub:cleanup` calls it every day.
 - There is no `/docs` page. The worker port is not published, so test it from the `web`
   container, which has `curl` and the token in `$DUBBER_TOKEN`:
 
@@ -198,7 +213,7 @@ docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBE
 
 http://localhost:8000/dub has one page: a file input, a voice choice (female Sreymom or male
 Piseth), a "dubbed video" checkbox (unticked gives Khmer subtitles only), a progress bar that
-updates every 3 seconds, download links when the job is done, and the last 20 jobs.
+updates every 3 seconds, download links when the job is done, and your last 20 videos.
 
 1. `POST /dub` checks the upload (MP4, MOV, MKV or WebM, at most 500 MB) and saves it under a
    random name in `web/storage/app/private/uploads/`. It adds a row to `video_jobs` and queues
@@ -218,6 +233,45 @@ after one hour (`$timeout = 3600`) and is not retried (`$tries = 1`).
 `queue:work` keeps the code it started with. After changing PHP code or config, run
 `docker compose restart queue`. The `web` service picks up changes on the next request.
 
+## Accounts
+
+Every page except login, registration and password reset needs an account. The login code was
+scaffolded once with Laravel Breeze (MIT). Its views were rewritten in plain Blade and CSS
+(`web/public/css/site.css`), so there is no Tailwind, npm or Node build. The Breeze package
+itself was removed again, because nothing uses it after scaffolding.
+
+- **Register** at `/register`, **log in** at `/login`, change your name, email or password or
+  delete your account at `/profile` (click your name at the top).
+- Each video belongs to the user who uploaded it. The page lists only your videos. Another user's
+  `/dub/<id>/status` or `/dub/<id>/download/...` answers 403 "This video belongs to another
+  account."
+- No real email is sent (`MAIL_MAILER=log`). A password reset link is written to
+  `web/storage/logs/laravel.log`; copy it from there.
+- Deleting your account deletes your videos, uploads and results at once. The worker's copies
+  go at the next daily cleanup once they are 7 days old.
+- Email addresses are not verified. That is fine on your own machine. Do not put this site
+  on the internet as it is.
+
+## Cleanup
+
+`php artisan dub:cleanup` deletes everything older than 7 days:
+
+1. every video row created more than 7 days ago, with its upload and its results;
+2. uploads that no row uses (older than 7 days), and result folders whose row is gone;
+3. on the worker, through `POST /cleanup`, the folders of finished jobs created more than 7 days ago.
+
+The `scheduler` service runs it every day at 00:00 UTC (07:00 in Cambodia). To run it by hand,
+or with another age:
+
+```bash
+docker compose exec web php artisan dub:cleanup
+docker compose exec web php artisan dub:cleanup --days=1
+docker compose exec web php artisan schedule:list   # shows when it runs next
+```
+
+If the worker cannot be reached, the site's own files are still deleted and the command fails
+with a message; the worker's folders are deleted on the next run.
+
 **PHP upload limits.** `web/docker/php.ini` sets `upload_max_filesize = 512M` and
 `post_max_size = 520M`, which allow the 500 MB (512000 KB) the upload form accepts. To change them,
 edit that file, rebuild both images that use it, and check the values:
@@ -236,13 +290,15 @@ Keep `post_max_size` a little above `upload_max_filesize`, and change the `max:5
 | -------- | ----------------------------- | --------------------------------- | ---- |
 | `web`    | `php:8.5.12-cli-trixie` + Composer 2.10 | `php artisan serve`   | 8000 |
 | `queue`  | same as `web`                 | `php artisan queue:work --timeout=3700` | none |
+| `scheduler` | same as `web`              | `php artisan schedule:work` (daily `dub:cleanup`) | none |
 | `mysql`  | `mysql:9.7.4` (LTS)           | database                          | none |
 | `worker` | `python:3.14.10-slim-trixie` + FFmpeg 7.1 | FastAPI on `worker:8001` | none |
 
 On a new database the `queue` service waits, printing "waiting for php artisan migrate",
-until you run the migrate command. Then it becomes healthy.
+until you run the migrate command. Then it becomes healthy. `queue` and `scheduler` start after
+`web` is healthy, so only `web` runs the first `composer install` and `APP_KEY` setup.
 
-The worker port is never published; only `web` and `queue` reach it on the Compose network.
+The worker port is never published; only the Laravel containers reach it on the Compose network.
 Volumes: `mysql_data` (database), `worker_jobs` (`/data/jobs`), `hf_cache` (downloaded models).
 In development `./web` and `./worker` are bind-mounted into their containers, so code changes
 need no rebuild. Rebuild only after changing a Dockerfile or `requirements.txt`.
@@ -262,6 +318,7 @@ the 16 kHz WAV itself and passes Whisper the samples.
 | Component | License |
 | --- | --- |
 | Laravel, FastAPI, faster-whisper, CTranslate2, pydub, pytest | MIT |
+| Laravel Breeze (used once to scaffold the login code, then removed) | MIT |
 | Uvicorn, PyTorch, httpx | BSD-3-Clause |
 | transformers, sentencepiece, python-multipart | Apache-2.0 |
 | edge-tts | LGPL-3.0 |
@@ -298,7 +355,11 @@ the 16 kHz WAV itself and passes Whisper the samples.
   page's other requests.
 - The Khmer labels and step messages on the page were written by AI and need review by a Khmer
   speaker.
-- There is no login yet (Phase 7), so everyone who can open the site sees and downloads every job.
+- No email is sent, so password reset links must be copied from `web/storage/logs/laravel.log`,
+  and email addresses are not verified. The site is meant for your own machine, not the internet
+  (`php artisan serve`, debug mode on, no HTTPS).
+- Videos, results and worker job folders are deleted 7 days after upload. Download what you
+  want to keep.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
   noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate
   but needs about twice the memory and time.

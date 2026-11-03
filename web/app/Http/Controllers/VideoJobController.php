@@ -22,15 +22,15 @@ class VideoJobController extends Controller
     private const HISTORY = 20;
 
     /**
-     * Show the upload form, the job being followed and the recent jobs.
+     * Show the upload form, the job being followed and the user's recent jobs.
      *
-     * The followed job is ?job=<id>, or else the newest job that has not finished.
+     * The followed job is ?job=<id> if it is the user's, or else their newest job that has not finished.
      */
     public function index(Request $request): View
     {
-        $jobs = VideoJob::latest('id')->limit(self::HISTORY)->get();
+        $jobs = $request->user()->videoJobs()->latest('id')->limit(self::HISTORY)->get();
         $current = $request->filled('job')
-            ? VideoJob::find($request->integer('job'))
+            ? $request->user()->videoJobs()->find($request->integer('job'))
             : $jobs->first(fn (VideoJob $job) => ! $job->isFinished());
 
         return view('dub.index', [
@@ -64,8 +64,7 @@ class VideoJobController extends Controller
             throw ValidationException::withMessages(['video' => 'The server could not save the video. Check its free disk space.']);
         }
 
-        $job = VideoJob::create([
-            'user_id' => $request->user()?->id,
+        $job = $request->user()->videoJobs()->create([
             'original_name' => Str::limit($file->getClientOriginalName(), 250, ''),
             'path' => $path,
             'gender' => $data['gender'] ?? 'female',
@@ -82,22 +81,34 @@ class VideoJobController extends Controller
     }
 
     /**
-     * The job's progress as JSON, polled by the page every 3 seconds.
+     * The job's progress as JSON, polled by the page every 3 seconds. Only for the user who uploaded it.
      */
-    public function status(VideoJob $job): JsonResponse
+    public function status(Request $request, VideoJob $job): JsonResponse
     {
+        $this->authorizeOwner($request, $job);
+
         return response()->json($this->statusData($job));
     }
 
     /**
      * Send a finished result: kind "srt" (Khmer subtitles) or "video" (Khmer dubbed MP4).
+     * Only for the user who uploaded it.
      */
-    public function download(VideoJob $job, string $kind): StreamedResponse
+    public function download(Request $request, VideoJob $job, string $kind): StreamedResponse
     {
+        $this->authorizeOwner($request, $job);
         $path = $kind === 'srt' ? $job->srt_path : $job->video_path;
         abort_if($path === null || ! Storage::disk('local')->exists($path), 404, 'This file is not ready or no longer exists.');
 
         return Storage::disk('local')->download($path, $job->downloadName($kind));
+    }
+
+    /**
+     * Answer 403 unless the signed-in user uploaded the job (job->user_id === auth()->id()).
+     */
+    private function authorizeOwner(Request $request, VideoJob $job): void
+    {
+        abort_unless($job->isOwnedBy($request->user()), 403, 'This video belongs to another account.');
     }
 
     /**

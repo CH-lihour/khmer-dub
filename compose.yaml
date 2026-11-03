@@ -52,9 +52,36 @@ services:
         condition: service_healthy
       worker:
         condition: service_healthy
+      # web runs the first composer install and APP_KEY setup; wait so they do not run twice at once.
+      web:
+        condition: service_healthy
     healthcheck:
       # Healthy once PID 1 has become the queue worker; if it dies the container stops.
       test: ["CMD", "sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline | grep -q '^php artisan queue:work'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # Runs Laravel's schedule (routes/console.php): dub:cleanup every day at 00:00 UTC.
+  scheduler:
+    build: *web-build
+    image: khmer-dub-web:dev
+    command: ["php", "artisan", "schedule:work"]
+    env_file: ./web/.env
+    environment:
+      DB_HOST: mysql
+      DUBBER_URL: http://worker:8001
+    volumes:
+      - ./web:/var/www/html
+    depends_on:
+      mysql:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline | grep -q '^php artisan schedule:work'"]
       interval: 30s
       timeout: 5s
       retries: 3

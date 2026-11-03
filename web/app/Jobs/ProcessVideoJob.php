@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Exceptions\DubbingFailed;
 use App\Models\VideoJob;
+use App\Support\Worker;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\ConnectionException;
@@ -11,7 +12,6 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\TimeoutExceededException;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Sleep;
@@ -57,7 +57,7 @@ class ProcessVideoJob implements ShouldQueue
         $language = $this->follow($job, $workerId);
 
         $job->update(['progress' => 99, 'message' => 'Downloading the results']);
-        $folder = "results/{$job->id}";
+        $folder = $job->resultsFolder();
         $srt = $this->download($workerId, 'srt', "{$folder}/khmer.srt");
         $video = $job->dub ? $this->download($workerId, 'video', "{$folder}/dubbed.mp4") : null;
 
@@ -82,7 +82,7 @@ class ProcessVideoJob implements ShouldQueue
     {
         return match (true) {
             $exception instanceof DubbingFailed => $exception->getMessage(),
-            $exception instanceof ConnectionException => 'The dubbing worker could not be reached. Check that it is running: docker compose ps worker',
+            $exception instanceof ConnectionException => Worker::UNREACHABLE,
             $exception instanceof TimeoutExceededException => 'Processing took longer than one hour, so it was stopped. Try a shorter video.',
             $exception instanceof MaxAttemptsExceededException => 'The queue stopped while this video was being processed. Please upload it again.',
             default => 'Something went wrong while dubbing the video. The details are in web/storage/logs/laravel.log.',
@@ -182,7 +182,7 @@ class ProcessVideoJob implements ShouldQueue
             $action, $this->videoJob->id, $response->status(), mb_substr($response->body(), 0, 500)));
 
         throw new DubbingFailed(match (true) {
-            $response->status() === 401 => 'The worker refused the token. DUBBER_TOKEN in web/.env must equal WORKER_TOKEN in worker/.env.',
+            $response->status() === 401 => Worker::WRONG_TOKEN,
             $response->status() === 404 && $action === 'report the progress' => 'The worker no longer has this job. Please upload the video again.',
             is_string($detail) && $detail !== '' => $detail,
             default => "The worker could not {$action} (HTTP {$response->status()}). Check the worker log: docker compose logs worker",
@@ -194,10 +194,6 @@ class ProcessVideoJob implements ShouldQueue
      */
     private function worker(): PendingRequest
     {
-        return Http::baseUrl(rtrim((string) config('services.dubber.url'), '/'))
-            ->withHeaders(['x-token' => (string) config('services.dubber.token')])
-            ->acceptJson()
-            ->connectTimeout(10)
-            ->timeout(30);
+        return Worker::client();
     }
 }
