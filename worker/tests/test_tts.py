@@ -100,6 +100,14 @@ def test_edge_no_audio_is_retried(no_sleep: None, tmp_path: Path, monkeypatch: p
     assert wav_info(out)[2] > 0.3
 
 
+def test_a_line_the_voice_cannot_read_is_not_called_a_network_problem(no_sleep: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = failing_edge(monkeypatch, failures=99, error=tts.edge_tts.exceptions.NoAudioReceived("No audio"))
+    with pytest.raises(StageError, match="could not read this line: සිංහල") as caught:
+        synth("සිංහල", tmp_path / "0.wav", "female")
+    assert "internet" not in str(caught.value)
+    assert len(attempts) == 3
+
+
 def test_text_with_nothing_to_say_is_silent_without_the_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = failing_edge(monkeypatch, failures=99)
     out = synth(" ។ ", tmp_path / "0.wav", "female")

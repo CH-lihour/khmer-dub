@@ -63,7 +63,7 @@ class DubPageTest extends TestCase
         $job = $this->makeJob(['original_name' => 'old talk.mp4', 'status' => 'done', 'progress' => 100, 'srt_path' => 'results/1/khmer.srt']);
 
         $this->get('/dub')->assertOk()
-            ->assertSee('Khmer Dub')->assertSee('បញ្ចូលសំឡេងខ្មែរ')->assertSee($this->user->name)
+            ->assertSee('Khmer Dub')->assertSee('Give your video a Khmer voice')->assertSee($this->user->name)
             ->assertSee('name="video"', false)->assertSee('name="gender"', false)->assertSee('name="dub"', false)
             ->assertSee('old talk.mp4')
             ->assertSee(route('dub.download', [$job, 'srt']));
@@ -163,7 +163,7 @@ class DubPageTest extends TestCase
         $this->getJson(route('dub.status', $job))->assertOk()->assertExactJson([
             'id' => $job->id, 'name' => 'talk.mp4', 'status' => 'processing', 'progress' => 45,
             'message' => 'Translating to Khmer', 'error' => null, 'language' => null, 'language_name' => null,
-            'dub' => true, 'status_url' => route('dub.status', $job), 'srt_url' => null, 'video_url' => null,
+            'dub' => true, 'status_url' => route('dub.status', $job), 'review_url' => null, 'srt_url' => null, 'video_url' => null,
         ]);
     }
 

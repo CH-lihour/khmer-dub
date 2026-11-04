@@ -1,22 +1,25 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ app()->getLocale() }}">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ $title ?? 'Khmer Dub' }}</title>
-    <link rel="stylesheet" href="{{ asset('css/site.css') }}?v={{ filemtime(public_path('css/site.css')) }}">
+    @include('layouts.head', ['title' => $title ?? null])
 </head>
 <body>
-<nav class="topbar" aria-label="Account">
-    <a class="brand" href="{{ route('dub.index') }}">Khmer Dub <span class="km">· បញ្ចូលសំឡេងខ្មែរ</span></a>
-    <div class="account">
-        <a href="{{ route('profile.edit') }}" title="Account · គណនី">{{ Auth::user()->name }}</a>
-        <form method="POST" action="{{ route('logout') }}">
-            @csrf
-            <button class="link" type="submit">Log out · ចាកចេញ</button>
-        </form>
-    </div>
-</nav>
+<header class="site">
+    <div class="krama"></div>
+    <nav class="topbar wrap" aria-label="{{ __('Account') }}">
+        <a class="brand" href="{{ route('dub.index') }}" aria-label="Khmer Dub"><x-logo /> <span class="brand-name">Khmer Dub</span></a>
+        <div class="account">
+            <x-language />
+            <a class="person" href="{{ route('profile.edit') }}" title="{{ Auth::user()->name }}" aria-label="{{ __('Account') }}">
+                <span class="avatar" aria-hidden="true">{{ mb_strtoupper(mb_substr(Auth::user()->name, 0, 1)) }}</span>
+            </a>
+            <form method="POST" action="{{ route('logout') }}">
+                @csrf
+                <button class="quiet" type="submit">{{ __('Log out') }}</button>
+            </form>
+        </div>
+    </nav>
+</header>
 <main>
     {{ $slot }}
 </main>

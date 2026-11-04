@@ -134,21 +134,33 @@ How the voice is made and fitted:
   `facebook/mms-tts-khm` offline (one voice, about 145 MB on the first run).
 - Each clip becomes WAV 24 kHz mono, and the silence around the speech is cut (edge-tts adds
   about 0.2 s before and 0.8 s after).
-- A clip may run up to 25 % past its line's slot, but never past the next line's start. A longer
-  clip is sped up with FFmpeg `atempo`, at most x1.6, and never slowed down. If it still does not
-  fit, its end is cut with a short fade.
+- A clip may run into the silence after its line, but never past the next line's start. Only a
+  clip that does not fit before the next line is sped up with FFmpeg `atempo`, at most x1.6, and
+  clips are never slowed down. If it still does not fit, its end is cut with a short fade.
 - `dubbed.mp4` copies the picture (`-c:v copy`) and adds the Khmer track as AAC, tagged as an
   AI-generated voice. MP4 cannot hold some WebM codecs (VP8, for example). Those videos are
   re-encoded to H.264 instead, which is slower.
+- The original sound plays under the Khmer voice at a fixed level, `ORIGINAL_VOLUME` in
+  `worker/.env` (default `0.15`, about 16 dB quieter; `0` leaves only the Khmer voice). Because the
+  level stays fixed, the original speech never gets loud between Khmer lines. After changing the
+  setting, run `docker compose up -d worker` so the worker reads `worker/.env` again.
 
 Segment times are fitted to the speech. Whisper's own times often start a line early (by up to
 2 s on the test clip) or let it run into the next one, so `stages/transcribe.py` does three things:
 it asks Whisper for word timestamps, splits a segment wherever two words are 1 s or more apart,
 and moves each edge onto the speech found by the Silero VAD (bundled with faster-whisper, MIT).
 
+A sentence split over two lines is then joined, so NLLB translates it whole. It happens only when
+the text shows that the sentence goes on: the line ends in a comma or similar, or the next one
+starts in lowercase. A line with no punctuation followed by a capital is left alone. Lines more than
+2.5 s apart are not joined, and a joined line is at most 12 s long. It gets one subtitle and one
+voice clip. Scripts without capitals (Chinese, Thai, Khmer) join only on a comma or similar.
+
 Translation runs locally with NLLB-200 (`facebook/nllb-200-distilled-600M`, target `khm_Khmr`),
 12 segments per batch. The Whisper-to-NLLB language map is in `worker/stages/translate.py`.
-Khmer videos skip the model. Latin, Breton and Hawaiian are not supported, because Whisper can
+Khmer videos skip the model, and only lines written in Khmer letters are kept. If there are none
+the job stops with a clear message, and so does a translation with no Khmer in it. Latin, Breton
+and Hawaiian are not supported, because Whisper can
 hear them but NLLB-200 cannot translate them.
 
 ## Worker API
@@ -159,8 +171,10 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 
 | Call | Answer |
 | --- | --- |
-| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`) | `{"job_id": "<32 hex>"}` |
+| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`) | `{"job_id": "<32 hex>"}` |
 | `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language"}` |
+| `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` |
+| `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km"}]}`) | `{"status": "queued"}`; saves the Khmer and resumes the job |
 | `GET /jobs/{id}/download/srt` | `khmer.srt` |
 | `GET /jobs/{id}/download/video` | `dubbed.mp4` (only for `dub=true`) |
 | `POST /cleanup` (form `days`, default 7) | `{"deleted": <count>}` |
@@ -172,8 +186,9 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
   than `MAX_VIDEO_MINUTES` is refused with 422 before it is queued. If FFmpeg itself is missing,
   the answer is 500.
 - `language` is the detected spoken language as a Whisper code (for example `en`), or `null`
-  until the job is done. `error` is `null` unless the job failed.
-- `gender` defaults to `female` and `dub` to `true` when they are left out.
+  until the Khmer is ready. `error` is `null` unless something failed.
+- `gender` defaults to `female`, `dub` to `true` and `review` to `false` when they are left out.
+- The review calls answer 409 for a job that is not in `review`, so saving twice cannot run it twice.
 - Jobs run one at a time on one worker thread, in upload order. Later uploads wait as `queued`.
 - Each job lives in `/data/jobs/<id>/` (the `worker_jobs` volume) with a `status.json`. After a
   restart, finished jobs can still be downloaded. A job that was queued or running when the
@@ -212,8 +227,18 @@ docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBE
 ## Web app
 
 http://localhost:8000/dub has one page: a file input, a voice choice (female Sreymom or male
-Piseth), a "dubbed video" checkbox (unticked gives Khmer subtitles only), a progress bar that
+Piseth), a **Dub the video** switch (off gives Khmer subtitles only), a progress bar that
 updates every 3 seconds, download links when the job is done, and your last 20 videos.
+
+The look is plain CSS in `web/public/css/site.css`, with no build step. Its colours are tokens at the
+top of that file, and light and dark follow the system setting. The checked pattern on every page
+and in the progress bar is a krama, drawn with CSS gradients. The font is Kantumruy Pro, a Khmer
+typeface. Its files are in `web/public/fonts/` (92 KB in all), so the site never fetches a font from outside.
+
+Every page has an **English / ខ្មែរ** switch and shows one language at a time. A first visit follows
+the browser's language, and the choice is kept in a cookie for a year, also after logging out. All
+the Khmer text is in `web/lang/km.json`, so a Khmer speaker can review it there. The English text is
+the key, and a text with no Khmer entry shows in English. A test fails if a page's text has no entry.
 
 1. `POST /dub` checks the upload (MP4, MOV, MKV or WebM, at most 500 MB) and saves it under a
    random name in `web/storage/app/private/uploads/`. It adds a row to `video_jobs` and queues
@@ -232,6 +257,23 @@ after one hour (`$timeout = 3600`) and is not retried (`$tries = 1`).
 
 `queue:work` keeps the code it started with. After changing PHP code or config, run
 `docker compose restart queue`. The `web` service picks up changes on the next request.
+
+## Editing the Khmer
+
+Machine translation makes mistakes, so a person can correct the Khmer before the voice is made.
+Turn on **Edit the Khmer first** when uploading. Without it, a job runs straight through.
+
+1. After translation the job stops at 50% with the status **Needs review**, and the page shows a
+   **Check the Khmer** link. The job holds no worker thread and no queue slot while it waits, so
+   other videos go ahead of it. It can wait for days, up to the 7 day cleanup.
+2. The review page shows each line's time and original text above its Khmer. Correct the text, or
+   empty a line to remove it from both the subtitles and the voice.
+   A line with letters but no Khmer ones cannot be saved, because the Khmer voice cannot read it.
+   Khmer with a Latin name in it, or a line of only digits, is fine.
+3. **Save and make the voice** (or **Save the subtitles**) resumes the job with your text.
+
+Your edits are kept if something goes wrong after saving. If the voice service is down or the
+worker restarts, the job returns to **Needs review** with the reason, and saving again retries it.
 
 ## Accounts
 
@@ -319,6 +361,7 @@ the 16 kHz WAV itself and passes Whisper the samples.
 | --- | --- |
 | Laravel, FastAPI, faster-whisper, CTranslate2, pydub, pytest | MIT |
 | Laravel Breeze (used once to scaffold the login code, then removed) | MIT |
+| Kantumruy Pro font (`web/public/fonts/`, license in `OFL.txt`) | SIL OFL 1.1 |
 | Uvicorn, PyTorch, httpx | BSD-3-Clause |
 | transformers, sentencepiece, python-multipart | Apache-2.0 |
 | edge-tts | LGPL-3.0 |
@@ -343,9 +386,12 @@ the 16 kHz WAV itself and passes Whisper the samples.
   sentence. The worker retries, and the job fails with a message after three tries.
 - MMS-TTS cannot read digits or Latin letters, and NLLB writes numbers as Khmer digits
   (`៥, ៤, ៣`), so with `mms` the numbers are silent.
-- The dubbed video has only the Khmer voice. The original music and sound effects are not kept.
-- Khmer is often longer than the original. A short line can lose the end of its speech even at
-  x1.6 (0.9 s of one 0.5 s line on the test clip), although the silence after it is free.
+- The original music and sound effects stay in the dubbed video, but so does the original speech,
+  quietly under the Khmer voice. Removing only the speech would need a separation tool such as
+  Demucs (MIT), about 1.5 to 3 times the video length on CPU. The sound is mono.
+- Khmer is often longer than the original, so the voice can keep talking after the speaker has
+  stopped (up to 0.8 s on the test clip). Lines with no silence after them are sped up instead,
+  and can still lose the end of their speech even at x1.6.
 - Making the voice takes about 2 seconds per line with edge-tts.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
 - The worker runs one job at a time, so an upload can wait in the queue behind a long video.
@@ -353,8 +399,11 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - The page cannot show how far a large upload has got; it shows "Uploading" until the server has
   the whole file. `php artisan serve` is a development server, and a slow upload can hold up the
   page's other requests.
-- The Khmer labels and step messages on the page were written by AI and need review by a Khmer
-  speaker.
+- The Khmer text of the site (`web/lang/km.json`) was written by AI and needs review by a Khmer
+  speaker. Error messages from the worker stay in English, also on the Khmer pages.
+- The review page edits text only. It cannot change a line's timing, split or join lines, or play
+  the video, so keep the video open next to it. An edited line that is much longer than the
+  original may be sped up or cut like any other.
 - No email is sent, so password reset links must be copied from `web/storage/logs/laravel.log`,
   and email addresses are not verified. The site is meant for your own machine, not the internet
   (`php artisan serve`, debug mode on, no HTTPS).
@@ -363,9 +412,14 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or
   noise it can invent short phrases such as "Thank you." `WHISPER_MODEL=medium` is more accurate
   but needs about twice the memory and time.
+- Whisper `small` could not write Khmer speech in Khmer letters in our test. It recognised a dubbed
+  Khmer video as Khmer (91% sure), but wrote Sinhala, Bengali and Latin junk, even with the language
+  forced. So a video already in Khmer usually stops with a clear message, and a dubbed file from
+  this site cannot be dubbed again: upload the original video. `medium` was not tested.
 - Speech detection can miss quiet or crackly speech (old recordings, distant voices). Then a line's
   end can be cut a little short, by up to about 0.5 s.
-- Subtitles keep the exact speech times. A very short line (0.5 s on the test clip) can disappear
-  before it is read, and a long one is shown as one line that the player wraps.
+- Subtitles keep the exact speech times. A very short line can disappear before it is read, and
+  a long one is shown as one line that the player wraps. Joining a split sentence makes that line
+  longer, and its voice does not stop for a pause the speaker made in the middle of it.
 - NLLB-200 and MMS-TTS weights are licensed for non-commercial use only.
 - Only use videos you own or may translate; label dubbed videos as AI-generated voice.

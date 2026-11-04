@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import re
 import wave
 from pathlib import Path
 
@@ -18,6 +19,10 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 SNAP_SECONDS = 0.5  # how close to the edge of a stretch of speech a boundary must be to snap onto it
 SPLIT_PAUSE_SECONDS = 1.0  # a pause this long between two words always starts a new segment
+JOIN_GAP_SECONDS = 2.5  # two lines further apart than this are never joined into one sentence
+JOIN_MAX_SECONDS = 12.0  # a joined line is never longer than this, so its subtitle stays readable
+SENTENCE_END = re.compile(r"[.!?…。！？។៕][\"'”’)\]»]*$")
+CLAUSE_MARKS = ",;:，、；：-–—"  # a line ending in one of these goes on in the next line
 
 
 def transcribe(wav_path: str | Path) -> tuple[list[dict], str]:
@@ -25,7 +30,8 @@ def transcribe(wav_path: str | Path) -> tuple[list[dict], str]:
 
     Each segment is {"id", "start", "end", "text"}, with times in seconds from the start of the
     video. Silence is skipped with the VAD filter and empty segments are dropped. Whisper's
-    boundaries are then moved onto the detected speech, because it often starts a line early.
+    boundaries are then moved onto the detected speech, because it often starts a line early, and
+    the parts of a sentence that was split over two lines are joined, so it is translated whole.
     Raises StageError if no speech is found or the model cannot be loaded.
     """
     audio = _read_wav(Path(wav_path))
@@ -44,8 +50,38 @@ def transcribe(wav_path: str | Path) -> tuple[list[dict], str]:
     _snap_to_speech(segments, _speech_regions(audio))
     for seg in segments:
         seg["start"], seg["end"] = round(seg["start"], 2), round(seg["end"], 2)
+    segments = _join_fragments(segments)
     log.info("Transcribed %d segments, language %s (p=%.2f)", len(segments), info.language, info.language_probability)
     return segments, info.language
+
+
+def _join_fragments(segments: list[dict]) -> list[dict]:
+    """Return the segments with each sentence fragment joined to the line before it, renumbered.
+
+    Translating a line that stops mid-sentence loses the context of the rest. A joined line keeps
+    the first start and the last end, so it gets one subtitle and one voice clip.
+    """
+    joined: list[dict] = []
+    for seg in segments:
+        if joined and _continues(joined[-1], seg):
+            joined[-1].update(end=seg["end"], text=f"{joined[-1]['text']} {seg['text']}")
+        else:
+            joined.append({**seg, "id": len(joined)})
+    return joined
+
+
+def _continues(line: dict, following: dict) -> bool:
+    """True if `following` clearly goes on with the sentence of `line`, and joining them stays short.
+
+    Many lines have no end punctuation at all, so a missing full stop proves nothing: the line must
+    end in a clause mark such as a comma, or the next one must start with a lowercase letter.
+    Scripts without capitals (Chinese, Thai, Khmer) therefore only join on a clause mark.
+    """
+    if following["start"] - line["end"] > JOIN_GAP_SECONDS or following["end"] - line["start"] > JOIN_MAX_SECONDS:
+        return False
+    if SENTENCE_END.search(line["text"]):
+        return False
+    return line["text"][-1] in CLAUSE_MARKS or following["text"][0].islower()
 
 
 def _split_at_pauses(piece: Segment) -> list[tuple[float, float, str]]:

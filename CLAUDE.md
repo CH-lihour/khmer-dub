@@ -47,6 +47,7 @@ WHISPER_DEVICE=cpu        # cuda if an NVIDIA GPU exists
 TTS_ENGINE=edge           # edge | mms
 WORK_DIR=/data/jobs
 MAX_VIDEO_MINUTES=15
+ORIGINAL_VOLUME=0.15      # original sound under the voice, 0 to 1; 0 = Khmer voice only
 ```
 
 **Laravel `.env` additions**
@@ -161,17 +162,19 @@ Both apps must follow this contract exactly. Every request to the worker carries
 
 | Method and path | Sends | Returns |
 | --- | --- | --- |
-| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`) | `{"job_id": "<hex>"}` |
+| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`) | `{"job_id": "<hex>"}` |
 | `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language"}` |
+| `GET /jobs/{id}/segments` | nothing | `{"segments": [{"id", "start", "end", "text", "km"}]}` while the job waits for review |
+| `PUT /jobs/{id}/segments` | JSON: `{"segments": [{"id", "km"}]}` | `{"status": "queued"}` after saving the Khmer and resuming the job; lines left out keep their text, and an empty line is dropped |
 | `GET /jobs/{id}/download/srt` | nothing | the .srt file |
 | `GET /jobs/{id}/download/video` | nothing | the dubbed .mp4 file |
 | `POST /cleanup` | form: `days` (number above 0, default 7) | `{"deleted": <count>}` after deleting finished job folders created more than `days` days ago; queued and running jobs are kept |
 
-**Status values**: `queued`, `processing`, `done`, `failed`. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the job is done; Laravel stores it in `video_jobs.language`.
+**Status values**: `queued`, `processing`, `review`, `done`, `failed`. `review` means a job sent with `review=true` has stopped after translation until its Khmer is saved; it holds no worker thread. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the Khmer is ready (`review` or `done`); Laravel stores it in `video_jobs.language`.
 
-**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 60 voice, 85 mix and merge, 100 done.
+**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge, 100 done.
 
-**Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 422 for bad input.
+**Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 409 for a review call on a job that is not in review, 422 for bad input. A failure or restart after the review sends the job back to `review` with `error` set, so the edits are kept and saving retries it.
 
 ## FastAPI worker specification
 
@@ -192,12 +195,14 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 - `transcribe(wav_path)` returns `(segments, language_code)` using faster-whisper with `vad_filter=True`.
 - Load the model once and reuse it. Use `int8` on CPU and `float16` on CUDA.
 - Skip empty segments. Raise a clear error if no speech is found.
+- Join a line to the next when the sentence clearly continues (the line ends in a comma or similar, or the next starts in lowercase), so it is translated whole. Never join lines more than 2.5 s apart or into a line longer than 12 s.
 
 **Stage 3: `translate.py`**
 
 - `translate(segments, src_lang)` fills `km` for every segment using NLLB-200 with target `khm_Khmr`.
 - Keep a dictionary that maps Whisper language codes to NLLB codes (for example `en` to `eng_Latn`, `zh` to `zho_Hans`, `th` to `tha_Thai`, `ja` to `jpn_Jpan`, `ko` to `kor_Hang`, `fr` to `fra_Latn`, `vi` to `vie_Latn`). Raise a clear error for an unmapped language.
-- If the source language is already Khmer (`km`), copy `text` into `km` and skip the model.
+- If the source language is already Khmer (`km`), copy `text` into `km` and skip the model, but only for lines written in Khmer letters. Raise a clear error if none are.
+- Raise a clear error if no translated line contains Khmer letters.
 - Translate in batches of 8 to 16 segments to save time. Load the model once.
 - Never call any online translation service.
 
@@ -211,8 +216,8 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 **Stage 5: `mix.py`**
 
 - `build_track(segments, total_ms, folder)` makes a silent track the length of the video and overlays each clip at its `start` time.
-- Only speed clips up, never slow them. Use FFmpeg `atempo` with a maximum factor of 1.6 (`MAX_SPEED`). Allow a clip to run up to 25 percent past its slot, but never past the next segment's start.
-- `merge(video, dub_wav, out)` uses `-c:v copy` and AAC audio, so the video is not re-encoded.
+- Only speed clips up, never slow them. Use FFmpeg `atempo` with a maximum factor of 1.6 (`MAX_SPEED`). Allow a clip to run into the silence after its slot, but never past the next segment's start. Speed it up only when it does not fit before the next segment.
+- `merge(video, dub_wav, out)` uses `-c:v copy` and AAC audio, so the video is not re-encoded. The original sound plays under the Khmer voice at a fixed `ORIGINAL_VOLUME`.
 - `write_srt(segments, path)` writes UTF-8 SRT with the Khmer text and the original timestamps.
 
 **`pipeline.py`**
@@ -238,7 +243,8 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `path` | string | stored upload path |
 | `gender` | string | `male` or `female`, default `female` |
 | `dub` | boolean | default true |
-| `status` | string | `queued`, `processing`, `done`, `failed` |
+| `review` | boolean | default false; stop for a person to edit the Khmer |
+| `status` | string | `queued`, `processing`, `review`, `done`, `failed` |
 | `progress` | tinyint | 0 to 100 |
 | `message` | string, nullable | current step text |
 | `language` | string, nullable | detected language |
@@ -248,8 +254,8 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 
 **Files and responsibilities**
 
-- `VideoJobController`: `index` (page and history), `store` (validate, save, dispatch), `status` (JSON), `download` (`srt` or `video`).
-- `ProcessVideoJob`: sends the upload to `POST /jobs`, polls `GET /jobs/{id}` every 4 seconds, updates the row, then downloads both results into `storage/app/results/{id}/`. Set `$timeout = 3600` and `$tries = 1`. On any exception, set `status=failed` and store the message.
+- `VideoJobController`: `index` (page and history), `store` (validate, save, dispatch), `status` (JSON), `download` (`srt` or `video`), `review` (edit page), `saveReview` (send the edits, dispatch again).
+- `ProcessVideoJob`: sends the upload to `POST /jobs`, polls `GET /jobs/{id}` every 4 seconds, updates the row, ends if the job waits for review (`saveReview` dispatches it again), then downloads both results into `storage/app/results/{id}/`. Set `$timeout = 3600` and `$tries = 1`. On any exception, set `status=failed` and store the message.
 - Config in `config/services.php` under `dubber` (`url`, `token`). Read both from `.env`.
 
 **Routes**
@@ -258,12 +264,14 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 GET  /dub                        index
 POST /dub                        store
 GET  /dub/{job}/status           status (JSON)
+GET  /dub/{job}/review           review (page)
+POST /dub/{job}/review           saveReview
 GET  /dub/{job}/download/{kind}  download (kind = srt | video)
 ```
 
-**Validation**: video required, `mimes:mp4,mov,mkv,webm`, maximum 512000 KB, `gender` in `male,female`, `dub` boolean.
+**Validation**: video required, `mimes:mp4,mov,mkv,webm`, maximum 512000 KB, `gender` in `male,female`, `dub` boolean, `review` boolean.
 
-**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, a progress bar, a status message, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the Khmer interface text in English and Khmer. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
+**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, a progress bar, a status message, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
 
 **Security basics**: add Laravel Breeze (free) for login in the last phase, then make `status` and `download` check `job->user_id === auth()->id()`. Never expose the worker port outside the machine.
 

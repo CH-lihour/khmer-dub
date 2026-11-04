@@ -4,6 +4,9 @@ namespace App\Http\Controllers;
 
 use App\Jobs\ProcessVideoJob;
 use App\Models\VideoJob;
+use App\Support\Worker;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Response;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -50,12 +53,13 @@ class VideoJobController extends Controller
             'video' => ['required', 'file', 'mimes:mp4,mov,mkv,webm', 'max:512000'],
             'gender' => ['sometimes', 'in:male,female'],
             'dub' => ['sometimes', 'boolean'],
+            'review' => ['sometimes', 'boolean'],
         ], [
-            'video.required' => 'Choose a video file.',
-            'video.uploaded' => 'The video did not upload completely. It may be larger than 500 MB.',
-            'video.mimes' => 'This file type is not supported. Upload an MP4, MOV, MKV or WebM video.',
-            'video.max' => 'The video is larger than 500 MB.',
-            'gender.in' => 'Choose the female or the male voice.',
+            'video.required' => __('Choose a video file.'),
+            'video.uploaded' => __('The video did not upload completely. It may be larger than 500 MB.'),
+            'video.mimes' => __('This file type is not supported. Upload an MP4, MOV, MKV or WebM video.'),
+            'video.max' => __('The video is larger than 500 MB.'),
+            'gender.in' => __('Choose the female or the male voice.'),
         ]);
 
         $file = $request->file('video');
@@ -69,6 +73,7 @@ class VideoJobController extends Controller
             'path' => $path,
             'gender' => $data['gender'] ?? 'female',
             'dub' => $request->boolean('dub'),
+            'review' => $request->boolean('review'),
             'message' => 'Waiting in the queue',
         ]);
         ProcessVideoJob::dispatch($job);
@@ -104,6 +109,74 @@ class VideoJobController extends Controller
     }
 
     /**
+     * Show the Khmer lines of a job waiting for review, next to the original text.
+     */
+    public function review(Request $request, VideoJob $job): View|RedirectResponse
+    {
+        $this->authorizeOwner($request, $job);
+        if ($job->status !== VideoJob::REVIEW) {
+            return redirect()->route('dub.index', ['job' => $job->id]);
+        }
+
+        try {
+            $response = Worker::client()->get("/jobs/{$job->worker_job_id}/segments");
+        } catch (ConnectionException) {
+            return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => Worker::UNREACHABLE]);
+        }
+        if (! $response->successful()) {
+            return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => $this->workerError($response)]);
+        }
+
+        return view('dub.review', ['job' => $job, 'segments' => $response->json('segments')]);
+    }
+
+    /**
+     * Send the reviewed Khmer to the worker and queue the job again to follow the rest of it.
+     */
+    public function saveReview(Request $request, VideoJob $job): RedirectResponse
+    {
+        $this->authorizeOwner($request, $job);
+        if ($job->status !== VideoJob::REVIEW) {
+            return redirect()->route('dub.index', ['job' => $job->id]);
+        }
+
+        $data = $request->validate([
+            'km' => ['required', 'array'],
+            'km.*' => ['nullable', 'string', 'max:2000'],
+        ], ['km.*.max' => __('A line can have at most 2000 characters.')]);
+        $lines = collect($data['km'])->map(fn (?string $text, int|string $id) => ['id' => (int) $id, 'km' => (string) $text]);
+
+        try {
+            $response = Worker::client()->put("/jobs/{$job->worker_job_id}/segments", ['segments' => $lines->values()->all()]);
+        } catch (ConnectionException) {
+            return back()->withInput()->withErrors(['review' => Worker::UNREACHABLE]);
+        }
+        if (! $response->successful()) {
+            return back()->withInput()->withErrors(['review' => $this->workerError($response)]);
+        }
+
+        $job->update(['status' => VideoJob::QUEUED, 'message' => 'Waiting in the queue', 'error' => null]);
+        ProcessVideoJob::dispatch($job);
+
+        return redirect()->route('dub.index', ['job' => $job->id]);
+    }
+
+    /**
+     * A clear sentence for a failed worker call.
+     */
+    private function workerError(Response $response): string
+    {
+        $detail = $response->json('detail');
+
+        return match (true) {
+            $response->status() === 401 => Worker::WRONG_TOKEN,
+            $response->status() === 404 => 'The worker no longer has this job. Please upload the video again.',
+            is_string($detail) && $detail !== '' => $detail,
+            default => "The worker answered HTTP {$response->status()}. Check the worker log: docker compose logs worker",
+        };
+    }
+
+    /**
      * Answer 403 unless the signed-in user uploaded the job (job->user_id === auth()->id()).
      */
     private function authorizeOwner(Request $request, VideoJob $job): void
@@ -123,12 +196,13 @@ class VideoJobController extends Controller
             'name' => $job->original_name,
             'status' => $job->status,
             'progress' => $job->progress,
-            'message' => $job->message,
-            'error' => $job->error,
+            'message' => $job->message ? __($job->message) : null, // stored in English
+            'error' => $job->error ? __($job->error) : null, // known messages have Khmer
             'language' => $job->language,
             'language_name' => $job->languageName(),
             'dub' => $job->dub,
             'status_url' => route('dub.status', $job),
+            'review_url' => $job->status === VideoJob::REVIEW ? route('dub.review', $job) : null,
             'srt_url' => $job->srt_path ? route('dub.download', [$job, 'srt']) : null,
             'video_url' => $job->video_path ? route('dub.download', [$job, 'video']) : null,
         ];

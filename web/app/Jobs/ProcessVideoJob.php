@@ -45,16 +45,31 @@ class ProcessVideoJob implements ShouldQueue
     public function __construct(public VideoJob $videoJob) {}
 
     /**
-     * Run the whole job. Any exception ends in failed(), which marks the row as failed.
+     * Run the job until the results are here, or until it waits for a person's review.
+     *
+     * A review can take days, so the job ends there instead of holding the queue. Saving the review
+     * dispatches it again, and it goes on following the same worker job. Any exception ends in
+     * failed(), which marks the row as failed.
      */
     public function handle(): void
     {
         $job = $this->videoJob;
-        $job->update(['status' => VideoJob::PROCESSING, 'progress' => 0, 'message' => 'Sending the video to the worker', 'error' => null]);
+        if ($job->worker_job_id === null) {
+            $job->update(['status' => VideoJob::PROCESSING, 'progress' => 0, 'message' => 'Sending the video to the worker', 'error' => null]);
+            $job->update(['worker_job_id' => $this->submit($job)]);
+        }
 
-        $workerId = $this->submit($job);
-        $job->update(['worker_job_id' => $workerId]);
-        $language = $this->follow($job, $workerId);
+        $workerId = $job->worker_job_id;
+        $status = $this->follow($job, $workerId);
+        $language = $status['language'] ?? null;
+        if ($status['status'] === 'review') {
+            $job->update([
+                'status' => VideoJob::REVIEW, 'progress' => (int) ($status['progress'] ?? 0), 'message' => $status['message'] ?? null,
+                'language' => $language, 'error' => $status['error'] ?? null,
+            ]);
+
+            return;
+        }
 
         $job->update(['progress' => 99, 'message' => 'Downloading the results']);
         $folder = $job->resultsFolder();
@@ -103,7 +118,9 @@ class ProcessVideoJob implements ShouldQueue
         try {
             $response = $this->worker()->timeout(self::TRANSFER_SECONDS)
                 ->attach('file', $stream, basename($job->path)) // the random stored name keeps the extension
-                ->post('/jobs', ['gender' => $job->gender, 'dub' => $job->dub ? 'true' : 'false']);
+                ->post('/jobs', [
+                    'gender' => $job->gender, 'dub' => $job->dub ? 'true' : 'false', 'review' => $job->review ? 'true' : 'false',
+                ]);
         } finally {
             if (is_resource($stream)) {
                 fclose($stream);
@@ -119,11 +136,14 @@ class ProcessVideoJob implements ShouldQueue
     }
 
     /**
-     * Poll GET /jobs/{id} every POLL_SECONDS and copy the progress into the row until the job ends.
+     * Poll GET /jobs/{id} every POLL_SECONDS and copy the progress into the row until the job stops.
      *
-     * Returns the detected language code. Throws DubbingFailed with the worker's reason if it failed.
+     * Returns the worker's status once it is done or waits for review. Throws DubbingFailed with
+     * the worker's reason if it failed.
+     *
+     * @return array<string, mixed>
      */
-    private function follow(VideoJob $job, string $workerId): ?string
+    private function follow(VideoJob $job, string $workerId): array
     {
         while (true) {
             $response = $this->worker()
@@ -131,8 +151,8 @@ class ProcessVideoJob implements ShouldQueue
                 ->get("/jobs/{$workerId}");
             $status = $this->check($response, 'report the progress')->json();
 
-            if (($status['status'] ?? null) === 'done') {
-                return $status['language'] ?? null;
+            if (in_array($status['status'] ?? null, ['done', 'review'], true)) {
+                return $status;
             }
             if (($status['status'] ?? null) === 'failed') {
                 throw new DubbingFailed($status['error'] ?? 'The worker could not process this video.');

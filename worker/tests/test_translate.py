@@ -28,6 +28,23 @@ def test_khmer_source_is_copied(no_model: None) -> None:
     assert [seg["km"] for seg in result] == ["សួស្តី", "អរគុណ"]
 
 
+def test_khmer_speech_written_in_another_script_is_refused(no_model: None) -> None:
+    # What Whisper really wrote for a Khmer video: Sinhala, Bengali and Latin, but no Khmer.
+    with pytest.raises(StageError, match="in Khmer already"):
+        translate(segments("සිංහල අකුරු", "মাযাযা হা", "miracles"), "km")
+
+
+def test_only_lines_really_in_khmer_are_kept(no_model: None) -> None:
+    result = translate(segments("សួស្តី", "සිංහල", "អរគុណ NASA"), "km")
+    assert [seg["km"] for seg in result] == ["សួស្តី", "", "អរគុណ NASA"]
+
+
+def test_a_translation_with_no_khmer_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(translate_module, "_translate_batch", lambda texts, src_code: list(texts))
+    with pytest.raises(StageError, match="did not produce any Khmer"):
+        translate(segments("Hello", "Goodbye"), "en")
+
+
 def test_unsupported_language(no_model: None) -> None:
     with pytest.raises(StageError, match="'la'"):
         translate(segments("Lorem ipsum"), "la")
@@ -38,7 +55,7 @@ def test_translates_in_batches_and_skips_empty_text(monkeypatch: pytest.MonkeyPa
 
     def fake_batch(texts: list[str], src_code: str) -> list[str]:
         calls.append((len(texts), src_code))
-        return [f" km:{text} " for text in texts]
+        return [f" ក:{text} " for text in texts]
 
     monkeypatch.setattr(translate_module, "_translate_batch", fake_batch)
     texts = [f"line {i}" for i in range(29)]
@@ -46,9 +63,9 @@ def test_translates_in_batches_and_skips_empty_text(monkeypatch: pytest.MonkeyPa
     result = translate(segments(*texts), "ja")
 
     assert calls == [(12, "jpn_Jpan"), (12, "jpn_Jpan"), (4, "jpn_Jpan")]
-    assert result[0]["km"] == "km:line 0"
+    assert result[0]["km"] == "ក:line 0"
     assert result[3]["km"] == ""
-    assert result[28]["km"] == "km:line 28"
+    assert result[28]["km"] == "ក:line 28"
 
 
 def test_language_map_includes_required_codes() -> None:

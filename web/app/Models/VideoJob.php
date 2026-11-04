@@ -17,6 +17,7 @@ use Locale;
  * @property string $path
  * @property string $gender
  * @property bool $dub
+ * @property bool $review
  * @property string $status
  * @property int $progress
  * @property string|null $message
@@ -32,13 +33,16 @@ class VideoJob extends Model
 
     public const PROCESSING = 'processing';
 
+    /** Stopped after translation until a person has checked the Khmer. */
+    public const REVIEW = 'review';
+
     public const DONE = 'done';
 
     public const FAILED = 'failed';
 
     /** @var list<string> */
     protected $fillable = [
-        'user_id', 'original_name', 'path', 'gender', 'dub', 'status', 'progress', 'message',
+        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'status', 'progress', 'message',
         'language', 'worker_job_id', 'srt_path', 'video_path', 'error',
     ];
 
@@ -46,6 +50,7 @@ class VideoJob extends Model
     protected $attributes = [
         'gender' => 'female',
         'dub' => true,
+        'review' => false,
         'status' => self::QUEUED,
         'progress' => 0,
     ];
@@ -55,7 +60,7 @@ class VideoJob extends Model
      */
     protected function casts(): array
     {
-        return ['user_id' => 'integer', 'dub' => 'boolean', 'progress' => 'integer'];
+        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'progress' => 'integer'];
     }
 
     /**
@@ -103,14 +108,14 @@ class VideoJob extends Model
     }
 
     /**
-     * The detected language as an English name ("English"), or null before it is known.
+     * The detected language by name, in the page's language, or null before it is known.
      */
     public function languageName(): ?string
     {
         if ($this->language === null) {
             return null;
         }
-        $name = Locale::getDisplayLanguage($this->language, 'en');
+        $name = Locale::getDisplayLanguage($this->language, app()->getLocale());
 
         return $name !== '' && $name !== $this->language ? $name : $this->language;
     }

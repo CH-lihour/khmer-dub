@@ -6,7 +6,7 @@ import logging
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from stages import StageError
+from stages import StageError, is_khmer
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +14,8 @@ MODEL_NAME = "facebook/nllb-200-distilled-600M"
 TARGET = "khm_Khmr"
 BATCH_SIZE = 12
 MAX_TOKENS = 256
+ALREADY_KHMER = "This video seems to be in Khmer already, so there is nothing to translate. Upload a video in another language."
+NO_KHMER = "The translation did not produce any Khmer text. Try a video with clearer speech."
 
 # Whisper language code -> NLLB-200 (FLORES-200) code. Whisper languages NLLB lacks
 # (Latin, Breton, Hawaiian) are left out on purpose and get a clear error.
@@ -44,12 +46,16 @@ WHISPER_TO_NLLB: dict[str, str] = {
 def translate(segments: list[dict], src_lang: str) -> list[dict]:
     """Fill `km` with the Khmer translation of `text` for every segment and return the segments.
 
-    `src_lang` is the Whisper language code. Khmer sources are copied without loading the model.
-    Raises StageError for a language NLLB-200 does not cover or if the model cannot be loaded.
+    `src_lang` is the Whisper language code. Khmer sources are copied without loading the model, but
+    only lines really written in Khmer: Whisper knows when speech is Khmer, yet writes it as garbage
+    in other scripts. Raises StageError if that leaves nothing, if no line came out in Khmer, for a
+    language NLLB-200 does not cover, or if the model cannot be loaded.
     """
     if src_lang == "km":
         for seg in segments:
-            seg["km"] = seg["text"]
+            seg["km"] = seg["text"] if is_khmer(seg["text"]) else ""
+        if not any(seg["km"] for seg in segments):
+            raise StageError(ALREADY_KHMER)
         return segments
 
     src_code = WHISPER_TO_NLLB.get(src_lang)
@@ -63,6 +69,8 @@ def translate(segments: list[dict], src_lang: str) -> list[dict]:
         batch = todo[start:start + BATCH_SIZE]
         for seg, km in zip(batch, _translate_batch([seg["text"] for seg in batch], src_code), strict=True):
             seg["km"] = km.strip()
+    if not any(is_khmer(seg["km"]) for seg in segments):
+        raise StageError(NO_KHMER)
     log.info("Translated %d segments from %s to %s", len(todo), src_code, TARGET)
     return segments
 

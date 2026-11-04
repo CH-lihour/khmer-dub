@@ -72,7 +72,8 @@ def _edge(text: str, voice: str, mp3: Path) -> Path:
     """Make the speech with edge-tts, retrying twice, and return the file written.
 
     Every failure is retried, including "no audio received", which the service sometimes sends
-    for ordinary sentences that work on the next try.
+    for ordinary sentences that work on the next try. If it still sends no audio, the service was
+    reached but could not read the line, which is a different problem from being unreachable.
     """
     error: Exception | None = None
     for attempt in range(EDGE_RETRIES + 1):
@@ -84,6 +85,8 @@ def _edge(text: str, voice: str, mp3: Path) -> Path:
             log.warning("edge-tts attempt %d of %d failed: %s", attempt + 1, EDGE_RETRIES + 1, exc)
             if attempt < EDGE_RETRIES:
                 time.sleep(2 * (attempt + 1))
+    if isinstance(error, edge_tts.exceptions.NoAudioReceived):
+        raise StageError(f"The Khmer voice could not read this line: {text[:60]}") from error
     raise StageError(EDGE_UNREACHABLE) from error
 
 

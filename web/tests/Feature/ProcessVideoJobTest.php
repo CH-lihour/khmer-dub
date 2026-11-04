@@ -133,6 +133,51 @@ class ProcessVideoJobTest extends TestCase
         Sleep::assertNeverSlept();
     }
 
+    public function test_a_job_that_waits_for_review_ends_without_holding_the_queue(): void
+    {
+        $row = $this->upload(['review' => true]);
+        $this->fakeWorker([
+            ['status' => 'processing', 'progress' => 45, 'message' => 'Translating to Khmer'],
+            ['status' => 'review', 'progress' => 50, 'message' => 'Waiting for your review', 'language' => 'en'],
+        ]);
+
+        $this->assertNull($this->process($row));
+
+        $row->refresh();
+        $this->assertSame(['review', 50, 'Waiting for your review', 'en', 'w1', null], [$row->status, $row->progress, $row->message, $row->language, $row->worker_job_id, $row->srt_path]);
+        Http::assertSent(fn (Request $request) => $request->url() === 'http://worker.test/jobs' && collect($request->data())->pluck('contents', 'name')['review'] === 'true');
+        Http::assertNotSent(fn (Request $request) => str_contains($request->url(), '/download/'));
+    }
+
+    public function test_a_saved_review_follows_the_same_worker_job_to_the_end(): void
+    {
+        $row = $this->upload(['review' => true, 'status' => 'queued', 'progress' => 50, 'worker_job_id' => 'w1', 'language' => 'en']);
+        $this->fakeWorker([
+            ['status' => 'processing', 'progress' => 60, 'message' => 'Making the Khmer voice'],
+            ['status' => 'done', 'progress' => 100, 'message' => 'Done', 'language' => 'en'],
+        ]);
+
+        $this->assertNull($this->process($row));
+
+        $row->refresh();
+        $this->assertSame(['done', 100, 'en'], [$row->status, $row->progress, $row->language]);
+        Storage::disk('local')->assertExists($row->srt_path);
+        Http::assertNotSent(fn (Request $request) => $request->url() === 'http://worker.test/jobs'); // not uploaded twice
+    }
+
+    public function test_a_voice_failure_after_review_goes_back_to_review_with_the_error(): void
+    {
+        $row = $this->upload(['review' => true, 'status' => 'queued', 'progress' => 50, 'worker_job_id' => 'w1']);
+        $this->fakeWorker([
+            ['status' => 'review', 'progress' => 50, 'message' => 'Waiting for your review', 'language' => 'en', 'error' => 'The voice service could not be reached.'],
+        ]);
+
+        $this->assertNull($this->process($row));
+
+        $row->refresh();
+        $this->assertSame(['review', 'The voice service could not be reached.'], [$row->status, $row->error]);
+    }
+
     public function test_the_worker_refusing_the_video_fails_the_job_with_its_reason(): void
     {
         $row = $this->upload();

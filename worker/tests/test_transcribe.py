@@ -8,7 +8,7 @@ import pytest
 import config
 from stages import StageError
 from stages.audio import extract_audio
-from stages.transcribe import _snap_to_speech, _split_at_pauses, transcribe
+from stages.transcribe import _join_fragments, _snap_to_speech, _split_at_pauses, transcribe
 from tests.conftest import SPEECH_DELAY_MS
 
 TOLERANCE = 0.3  # seconds between a segment edge and the measured speech edge
@@ -64,6 +64,67 @@ def test_snap_without_detected_speech_changes_nothing() -> None:
     segments = [seg(1.0, 2.0)]
     _snap_to_speech(segments, [])
     assert segments == [seg(1.0, 2.0)]
+
+
+def line(start: float, end: float, text: str) -> dict:
+    """A segment for _join_fragments. The ids are wrong on purpose: they must be renumbered."""
+    return {"id": 99, "start": start, "end": end, "text": text}
+
+
+def test_join_the_split_sentence_of_the_test_clip() -> None:
+    joined = _join_fragments([
+        line(21.28, 26.74, "Development and operation of vehicles"),
+        line(26.84, 29.00, "It's one small step for man,"),
+        line(30.92, 31.43, "one science leap for me"),
+        line(33.76, 40.20, "Long-range studies of the benefits"),
+    ])
+    assert joined == [
+        {"id": 0, "start": 21.28, "end": 26.74, "text": "Development and operation of vehicles"},
+        {"id": 1, "start": 26.84, "end": 31.43, "text": "It's one small step for man, one science leap for me"},
+        {"id": 2, "start": 33.76, "end": 40.20, "text": "Long-range studies of the benefits"},
+    ]
+
+
+def test_join_a_chain_of_fragments() -> None:
+    joined = _join_fragments([line(0, 2, "We went to the moon,"), line(2, 4, "and then"), line(4, 6, "we came back.")])
+    assert joined == [{"id": 0, "start": 0, "end": 6, "text": "We went to the moon, and then we came back."}]
+
+
+def test_join_a_lowercase_start_without_punctuation() -> None:
+    assert len(_join_fragments([line(0, 2, "We went to"), line(2, 4, "the moon")])) == 1
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        ("We went to the moon.", "and came back"),  # a finished sentence
+        ("Did we go?", "yes"),
+        ("He said \"go.\"", "and went"),
+        ("យើងទៅ។", "and came back"),  # Khmer full stop
+        ("We have a big job", "Expansion of knowledge"),  # no punctuation and a capital: unknown, so kept apart
+        ("我们去了月球", "然后回来了"),  # no capitals in this script and no clause mark
+    ],
+)
+def test_lines_that_do_not_clearly_continue_stay_apart(first: str, second: str) -> None:
+    assert len(_join_fragments([line(0, 2, first), line(2, 4, second)])) == 2
+
+
+def test_uncased_scripts_join_on_a_clause_mark() -> None:
+    assert len(_join_fragments([line(0, 2, "我们去了月球，"), line(2, 4, "然后回来了")])) == 1
+
+
+def test_lines_far_apart_are_not_joined() -> None:
+    assert len(_join_fragments([line(0, 2, "We went to the moon,"), line(4.6, 6, "and back")])) == 2
+
+
+def test_joined_line_stays_short_enough_to_read() -> None:
+    assert len(_join_fragments([line(0, 7, "A long line,"), line(7, 13, "and another")])) == 2
+
+
+def test_join_chain_stops_at_the_length_limit() -> None:
+    lines = [line(0, 5, "one,"), line(5, 10, "two,"), line(10, 15, "three,"), line(15, 20, "four")]
+    joined = _join_fragments(lines)
+    assert [(seg["id"], seg["text"]) for seg in joined] == [(0, "one, two,"), (1, "three, four")]
 
 
 @pytest.mark.models

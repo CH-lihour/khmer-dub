@@ -8,12 +8,12 @@ from pathlib import Path
 import numpy as np
 from pydub import AudioSegment
 
+import config
 from stages import StageError
 
 log = logging.getLogger(__name__)
 
 MAX_SPEED = 1.6  # clips are sped up at most this much, and never slowed down
-OVERRUN = 1.25  # a clip may run 25 % past its slot, but never past the next segment's start
 TRACK_RATE = 24000  # the clips from Stage 4 are WAV 24 kHz mono
 FADE_MS = 40
 
@@ -21,10 +21,10 @@ FADE_MS = 40
 def build_track(segments: list[dict], total_ms: int, folder: str | Path) -> Path:
     """Place every clip at its segment's start on a silent track as long as the video; return folder/dub.wav.
 
-    A clip longer than its room (25 % past its slot, but not past the next segment or the end of the
-    video) is sped up with FFmpeg atempo, at most MAX_SPEED. If it is still too long, its end is cut
-    with a short fade. Each placed segment gets "speed" (factor used), "cut_ms" (speech cut off)
-    and "dub_end" (when its voice ends, in seconds).
+    A clip may run into the silence after its slot. Only a clip longer than its room (up to the next
+    segment or the end of the video) is sped up with FFmpeg atempo, at most MAX_SPEED. If it is still
+    too long, its end is cut with a short fade. Each placed segment gets "speed" (factor used),
+    "cut_ms" (speech cut off) and "dub_end" (when its voice ends, in seconds).
     """
     folder = Path(folder)
     # A NumPy buffer, because overlaying hundreds of clips on a long pydub track copies it every time.
@@ -35,7 +35,7 @@ def build_track(segments: list[dict], total_ms: int, folder: str | Path) -> Path
         if not seg.get("clip"):
             continue
         next_start = segments[i + 1]["start"] if i + 1 < len(segments) else total
-        room_ms = int(min((seg["end"] - seg["start"]) * OVERRUN, next_start - seg["start"], total - seg["start"]) * 1000)
+        room_ms = int(min(next_start - seg["start"], total - seg["start"]) * 1000)
         if room_ms <= 0:
             log.warning("Segment %s has no room for its voice; skipped", seg["id"])
             continue
@@ -65,13 +65,14 @@ def build_track(segments: list[dict], total_ms: int, folder: str | Path) -> Path
 
 
 def merge(video: str | Path, dub_wav: str | Path, out: str | Path) -> Path:
-    """Write an MP4 with the video's picture and the Khmer track as its only sound; return its path.
+    """Write an MP4 with the video's picture, and the Khmer track over the quiet original sound; return its path.
 
     The picture is copied as is (-c:v copy). Only when MP4 cannot hold the video codec (VP8 from
-    WebM, for example) is it re-encoded to H.264. The sound is AAC, labelled as an AI-generated voice.
+    WebM, for example) is it re-encoded to H.264. The original sound plays at ORIGINAL_VOLUME all the
+    way through (0 leaves only the Khmer track). The sound is AAC, labelled as an AI-generated voice.
     """
     out = Path(out)
-    inputs = ["-i", str(video), "-i", str(dub_wav), "-map", "0:v:0", "-map", "1:a:0"]
+    inputs = ["-i", str(video), "-i", str(dub_wav), "-map", "0:v:0", *_sound_args(video)]
     audio = ["-c:a", "aac", "-b:a", "160k", "-metadata:s:a:0", "language=khm",
              "-metadata:s:a:0", "title=Khmer (AI-generated voice)",
              "-metadata", "comment=Dubbed into Khmer with an AI-generated voice", "-movflags", "+faststart", str(out)]
@@ -105,6 +106,28 @@ def write_srt(segments: list[dict], path: str | Path) -> int:
     path.write_text("\n".join(blocks), encoding="utf-8")
     log.info("Wrote %d subtitles to %s", len(cues), path)
     return len(cues)
+
+
+def _sound_args(video: str | Path) -> list[str]:
+    """FFmpeg arguments that pick the sound: the Khmer track, mixed over the quieted original if there is one.
+
+    The volume stays fixed instead of rising between lines, so the original speech never comes back
+    loudly when a Khmer line ends early. The limiter stops the mix from clipping on loud moments.
+    """
+    if config.ORIGINAL_VOLUME <= 0 or not _has_sound(video):
+        return ["-map", "1:a:0"]
+    # rematrix_maxval=1 averages stereo into mono; without it the channels add up, 3 dB too loud.
+    mix = (f"[0:a:0]aresample={TRACK_RATE}:ochl=mono:rematrix_maxval=1,volume={config.ORIGINAL_VOLUME}[original];"
+           "[1:a:0][original]amix=inputs=2:duration=first:normalize=0,"
+           "alimiter=limit=0.97:level=false:latency=true[sound]")
+    return ["-filter_complex", mix, "-map", "[sound]"]
+
+
+def _has_sound(video: str | Path) -> bool:
+    """True if the file has an audio stream."""
+    result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                             "-of", "csv=p=0", str(video)], check=True, capture_output=True, text=True)
+    return bool(result.stdout.strip())
 
 
 def _load_clip(path: Path) -> AudioSegment:

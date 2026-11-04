@@ -84,6 +84,37 @@ def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.Mon
     assert result["srt"].exists()
 
 
+def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voice(
+    fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    voiced: list[str] = []
+
+    def synth_all(segments: list[dict], folder: Path, gender: str) -> list[dict]:
+        voiced.extend(seg["km"] for seg in segments)
+        return segments
+
+    monkeypatch.setattr(pipeline, "synth_all", synth_all)
+    monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out: out)
+    job = tmp_path / "job"
+    milestones: list[int] = []
+
+    prepared = pipeline.prepare(job, "in.mp4", lambda p, m: milestones.append(p))
+
+    assert prepared == {"language": "en", "duration": 60.0}
+    assert milestones == [5, 15, 45]
+    assert not (job / "khmer.srt").exists()
+    segments = pipeline.load_segments(job)
+    segments[0]["km"] = "ជំរាបសួរ"
+    pipeline.save_segments(job, segments)
+
+    result = pipeline.finish(job, "in.mp4", "female", True, prepared["duration"], lambda p, m: milestones.append(p))
+
+    assert milestones == [5, 15, 45, 60, 85, 100]
+    assert voiced == ["ជំរាបសួរ"]
+    assert "ជំរាបសួរ" in result["srt"].read_text(encoding="utf-8")
+
+
 @pytest.mark.models
 def test_real_video_to_khmer_srt(speech_video: Path, tmp_path: Path) -> None:
     result = pipeline.run(tmp_path / "job", speech_video, "female", False, lambda p, m: None)
