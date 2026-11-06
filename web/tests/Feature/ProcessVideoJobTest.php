@@ -178,6 +178,96 @@ class ProcessVideoJobTest extends TestCase
         $this->assertSame(['review', 'The voice service could not be reached.'], [$row->status, $row->error]);
     }
 
+    public function test_a_job_cancelled_while_it_waited_in_the_queue_is_not_started(): void
+    {
+        Http::fake();
+        $row = $this->upload();
+        $this->assertTrue($row->cancelUnsent());
+
+        $this->assertNull($this->process($row));
+
+        Http::assertNothingSent();
+        $this->assertSame('cancelled', $row->fresh()->status);
+    }
+
+    public function test_a_job_the_worker_cancelled_ends_without_results(): void
+    {
+        $row = $this->upload();
+        $status = ['progress' => 15, 'message' => 'Transcribing speech', 'error' => null, 'language' => null, 'done' => 8, 'total' => 60];
+        $polls = 0;
+        $this->fakeWorker([], ['worker.test/jobs/w1' => function () use ($row, $status, &$polls) {
+            if (++$polls === 1) {
+                return Http::response(['status' => 'processing'] + $status);
+            }
+            VideoJob::whereKey($row->id)->update(['cancel_requested' => true]); // the site, not this copy of the row
+
+            return Http::response(['status' => 'cancelled', 'message' => 'Cancelled'] + $status);
+        }]);
+
+        $this->assertNull($this->process($row));
+
+        $row->refresh();
+        $this->assertSame('cancelled', $row->status);
+        $this->assertSame('Cancelled', $row->message);
+        $this->assertSame(15, $row->progress);
+        $this->assertFalse($row->cancel_requested);
+        $this->assertNull($row->step_total);
+        $this->assertNull($row->video_path);
+        Http::assertNotSent(fn (Request $request) => str_contains($request->url(), '/download/'));
+    }
+
+    public function test_a_job_cancelled_after_its_review_clears_the_request(): void
+    {
+        $row = $this->upload(['review' => true, 'status' => 'queued', 'progress' => 50, 'worker_job_id' => 'w1']);
+        $this->fakeWorker([], ['worker.test/jobs/w1' => function () use ($row) {
+            VideoJob::whereKey($row->id)->update(['cancel_requested' => true]);
+
+            return Http::response(['status' => 'review', 'progress' => 50, 'message' => 'Waiting for your review', 'error' => null, 'language' => 'en']);
+        }]);
+
+        $this->assertNull($this->process($row));
+
+        $this->assertSame('review', $row->fresh()->status);
+        $this->assertFalse($row->fresh()->cancel_requested);
+    }
+
+    public function test_cancelling_while_the_video_is_on_its_way_reaches_the_worker_when_it_arrives(): void
+    {
+        $row = $this->upload();
+        $this->fakeWorker([['status' => 'cancelled', 'progress' => 0, 'message' => 'Cancelled']], [
+            'worker.test/jobs' => function () use ($row) {
+                VideoJob::whereKey($row->id)->update(['cancel_requested' => true]);
+
+                return Http::response(['job_id' => 'w1']);
+            },
+            'worker.test/jobs/w1/cancel' => Http::response(['status' => 'processing']),
+        ]);
+
+        $this->assertNull($this->process($row));
+
+        Http::assertSent(fn (Request $request) => $request->url() === 'http://worker.test/jobs/w1/cancel' && $request->method() === 'POST');
+        $this->assertSame('cancelled', $row->fresh()->status);
+    }
+
+    public function test_the_row_shows_how_far_a_step_is_until_the_step_ends(): void
+    {
+        $row = $this->upload();
+        $seen = [];
+        Sleep::whenFakingSleep(function () use ($row, &$seen) {
+            $seen[] = [$row->fresh()->step_done, $row->fresh()->step_total];
+        });
+        $this->fakeWorker([
+            ['status' => 'processing', 'progress' => 70, 'message' => 'Making the Khmer voice', 'done' => 12, 'total' => 29],
+            ['status' => 'processing', 'progress' => 85, 'message' => 'Mixing and merging'],
+            ['status' => 'done', 'progress' => 100, 'language' => 'en'],
+        ]);
+
+        $this->assertNull($this->process($row));
+
+        $this->assertSame([[12, 29], [null, null]], $seen);
+        $this->assertSame([null, null], [$row->fresh()->step_done, $row->fresh()->step_total]);
+    }
+
     public function test_a_video_made_again_replaces_the_old_results(): void
     {
         Storage::disk('local')->put('results/1/dubbed.mp4', 'old video');

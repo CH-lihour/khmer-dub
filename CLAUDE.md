@@ -163,19 +163,21 @@ Both apps must follow this contract exactly. Every request to the worker carries
 | Method and path | Sends | Returns |
 | --- | --- | --- |
 | `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`), `original_volume` (0 to 1, how loud the original sound plays under the Khmer voice; 0 = off, default `ORIGINAL_VOLUME`) | `{"job_id": "<hex>"}` |
-| `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language"}` |
+| `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language", "done", "total"}` |
 | `GET /jobs/{id}/segments` | nothing | `{"segments": [{"id", "start", "end", "text", "km"}]}` while the job is in `review` or `done` |
 | `PUT /jobs/{id}/segments` | JSON: `{"segments": [{"id", "km"}]}`, optional `gender` and `original_volume` | `{"status": "queued"}` after saving the Khmer and choices and resuming the job; lines left out keep their text, choices left out stay, and an empty line is dropped |
 | `POST /jobs/{id}/reopen` | multipart: `file` (the original video) | `{"status": "review"}`, putting a `done` job back in review to make its results again; also accepted in `review`, so a refused save can be sent again |
+| `POST /jobs/{id}/cancel` | nothing | `{"status": <status now>}`, stopping a queued or running job: `cancelled`, or `review` for a job past its review, once it has stopped; `queued` or `processing` while a running job gets to its next step |
+| `DELETE /jobs/{id}` | nothing | `{"status": "deleted"}` after deleting a job that is not queued or running, with its folder |
 | `GET /jobs/{id}/download/srt` | nothing | the .srt file |
 | `GET /jobs/{id}/download/video` | nothing | the dubbed .mp4 file |
 | `POST /cleanup` | form: `days` (number above 0, default 7) | `{"deleted": <count>}` after deleting finished job folders created more than `days` days ago; queued and running jobs are kept |
 
-**Status values**: `queued`, `processing`, `review`, `done`, `failed`. `review` means a job sent with `review=true` has stopped after translation, or a finished job was reopened, until its Khmer is saved; it holds no worker thread. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the Khmer is ready (`review` or `done`); Laravel stores it in `video_jobs.language`.
+**Status values**: `queued`, `processing`, `review`, `done`, `failed`, `cancelled`. `review` means a job sent with `review=true` has stopped after translation, or a finished job was reopened, until its Khmer is saved; it holds no worker thread. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the Khmer is ready (`review` or `done`); Laravel stores it in `video_jobs.language`.
 
-**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge, 100 done.
+**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge, 100 done. Inside the long steps the progress moves on, and `done` and `total` say how far the step is: seconds of the video while transcribing, lines while translating or making the voice. Otherwise they are null.
 
-**Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 409 for a review call on a job that is not in review or a reopen of a job that cannot be edited, 422 for bad input. A failure or restart after the review sends the job back to `review` with `error` set, so the edits are kept and saving retries it.
+**Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 409 for a review call on a job that is not in review, a reopen of a job that cannot be edited, a cancel of a job that is not queued or running, or a delete of one that is, 422 for bad input. A failure or restart after the review sends the job back to `review` with `error` set, so the edits are kept and saving retries it. A job cancelled after its review also goes back to `review`, without an error.
 
 ## FastAPI worker specification
 
@@ -246,20 +248,22 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `dub` | boolean | default true |
 | `review` | boolean | default false; stop for a person to edit the Khmer |
 | `original_volume` | decimal(3,2) | default 0; original sound under the voice, 0 (off) to 1 |
-| `status` | string | `queued`, `processing`, `review`, `done`, `failed` |
+| `status` | string | `queued`, `processing`, `review`, `done`, `failed`, `cancelled` |
 | `progress` | tinyint | 0 to 100 |
 | `message` | string, nullable | current step text |
+| `step_done`, `step_total` | integer, nullable | how far the current step is, from the worker's `done` and `total` |
 | `language` | string, nullable | detected language |
 | `worker_job_id` | string, nullable | id returned by the worker |
 | `srt_path`, `video_path` | string, nullable | saved results |
 | `error` | text, nullable | failure reason |
+| `cancel_requested` | boolean | default false; a person asked to stop the job and the worker has not stopped yet |
 
 `users` also has `dub_options` (JSON, nullable): the user's latest choices on the upload form (`gender`, `dub`, `review`, `original_volume`), saved as soon as one changes. The form starts from them. They stay after cleanup deletes the user's jobs.
 
 **Files and responsibilities**
 
-- `VideoJobController`: `index` (page and history), `store` (validate, save, dispatch), `saveOptions` (keep the form's choices), `status` (JSON), `download` (`srt` or `video`), `preview` (`video` with range requests, or the subtitles as `vtt`, for the page's player), `review` (edit page, for a job in review or a finished dubbed video), `saveReview` (send the edits, with the video again for a finished job, dispatch again).
-- `ProcessVideoJob`: sends the upload to `POST /jobs`, polls `GET /jobs/{id}` every 4 seconds, updates the row, ends if the job waits for review (`saveReview` dispatches it again), then downloads both results into `storage/app/results/{id}/`, replacing older ones only once both have arrived. Set `$timeout = 3600` and `$tries = 1`. On any exception, set `status=failed` and store the message; if an older video exists, the job stays `done` with the message instead.
+- `VideoJobController`: `index` (page and history), `store` (validate, save, dispatch), `saveOptions` (keep the form's choices), `status` (JSON), `cancel` (stop a waiting or running job), `destroy` (delete a stopped video for good, on the worker first), `download` (`srt` or `video`), `preview` (`video` with range requests, or the subtitles as `vtt`, for the page's player), `review` (edit page, for a job in review or a finished dubbed video), `saveReview` (send the edits, with the video again for a finished job, dispatch again).
+- `ProcessVideoJob`: sends the upload to `POST /jobs`, polls `GET /jobs/{id}` every 4 seconds, updates the row, ends if the job waits for review (`saveReview` dispatches it again) or was cancelled, then downloads both results into `storage/app/results/{id}/`, replacing older ones only once both have arrived. Set `$timeout = 3600`, `$tries = 1` and `$deleteWhenMissingModels = true`. On any exception, set `status=failed` and store the message; if an older video exists, the job stays `done` with the message instead.
 - Config in `config/services.php` under `dubber` (`url`, `token`). Read both from `.env`.
 
 **Routes**
@@ -269,6 +273,8 @@ GET  /dub                        index
 POST /dub                        store
 POST /dub/options                saveOptions (the form's choices, sent when one changes)
 GET  /dub/{job}/status           status (JSON)
+POST /dub/{job}/cancel           cancel (JSON, the job's status)
+DELETE /dub/{job}                destroy
 GET  /dub/{job}/review           review (page)
 POST /dub/{job}/review           saveReview
 GET  /dub/{job}/download/{kind}  download (kind = srt | video)
@@ -277,9 +283,9 @@ GET  /dub/{job}/preview/{kind}   preview (kind = video | vtt), inline for the pl
 
 **Validation**: video required, `mimes:mp4,mov,mkv,webm`, maximum 512000 KB, `gender` in `male,female`, `dub` boolean, `review` boolean, `original_volume` number from 0 to 1.
 
-**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, an original sound slider (0 to 100%, starts at Off, shown only when dubbing), a progress bar, a status message, a video player with the Khmer subtitles that shows a dubbed result when done, a Play link on every dubbed video in the history, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
+**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, an original sound slider (0 to 100%, starts at Off, shown only when dubbing), a progress bar, a status message, the current step with how far it is, which unfolds into the list of all the job's steps when clicked, a cancel button with a confirmation dialog while the job can still be stopped, a delete button with a confirmation dialog on every stopped video, a video player with the Khmer subtitles and a close button that shows a dubbed result when done, a Play link on every dubbed video in the history, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
 
-**Security basics**: add Laravel Breeze (free) for login in the last phase, then make `status`, `download` and `preview` check `job->user_id === auth()->id()`. Never expose the worker port outside the machine.
+**Security basics**: add Laravel Breeze (free) for login in the last phase, then make `status`, `cancel`, `destroy`, `download` and `preview` check `job->user_id === auth()->id()`. Never expose the worker port outside the machine.
 
 ## Build phases and acceptance checks
 

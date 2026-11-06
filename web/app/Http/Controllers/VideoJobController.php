@@ -123,6 +123,51 @@ class VideoJobController extends Controller
     }
 
     /**
+     * Stop a job that is waiting or running, and answer its status as JSON.
+     *
+     * A video not sent to the worker yet ends here. Otherwise the worker is asked to stop it: a job
+     * in line there stops at once, and a running one at its next step, which ProcessVideoJob then
+     * sees. A video still on its way is cancelled by ProcessVideoJob when it arrives. Only for the
+     * user who uploaded it.
+     */
+    public function cancel(Request $request, VideoJob $job): JsonResponse
+    {
+        $this->authorizeOwner($request, $job);
+        if ($job->isRunning() && ! $job->cancelUnsent()) {
+            $job->update(['cancel_requested' => true]);
+            $refused = $job->refresh()->worker_job_id !== null ? $this->cancelOnWorker($job) : null;
+            if ($refused !== null) {
+                return response()->json(['message' => __($refused)], 503);
+            }
+        }
+
+        return response()->json($this->statusData($job->refresh()));
+    }
+
+    /**
+     * Delete a stopped video for good: its worker job, upload, results and row. Nothing is deleted
+     * here unless the worker has let go of it too, so no copy stays behind. Only for the user who
+     * uploaded it.
+     */
+    public function destroy(Request $request, VideoJob $job): HttpResponse
+    {
+        $this->authorizeOwner($request, $job);
+        if ($job->isRunning()) {
+            return response()->json(['message' => __('Cancel this video before deleting it.')], 409);
+        }
+
+        $refused = $job->worker_job_id !== null ? $this->deleteOnWorker($job) : null;
+        if ($refused !== null) {
+            return response()->json(['message' => __($refused)], 503);
+        }
+
+        $job->deleteFiles();
+        $job->delete();
+
+        return response()->noContent();
+    }
+
+    /**
      * Send a finished result: kind "srt" (Khmer subtitles) or "video" (Khmer dubbed MP4).
      * Only for the user who uploaded it.
      */
@@ -208,7 +253,7 @@ class VideoJobController extends Controller
             return back()->withInput()->withErrors(['review' => $this->workerError($response)]);
         }
 
-        $job->update(['status' => VideoJob::QUEUED, 'progress' => 50, 'message' => 'Waiting in the queue', 'error' => null, ...$choices]);
+        $job->update(['status' => VideoJob::QUEUED, 'progress' => 50, 'message' => 'Waiting in the queue', 'error' => null, 'cancel_requested' => false, ...$choices]);
         ProcessVideoJob::dispatch($job);
 
         return redirect()->route('dub.index', ['job' => $job->id]);
@@ -234,6 +279,47 @@ class VideoJobController extends Controller
                 fclose($stream);
             }
         }
+    }
+
+    /**
+     * Ask the worker to stop a job. Returns why it could not, or null. A job it finished just now
+     * cannot be stopped any more, so it goes on as normal; a job it no longer has is over.
+     */
+    private function cancelOnWorker(VideoJob $job): ?string
+    {
+        try {
+            $response = Worker::client()->post("/jobs/{$job->worker_job_id}/cancel");
+        } catch (ConnectionException) {
+            $job->update(['cancel_requested' => false]);
+
+            return Worker::UNREACHABLE;
+        }
+
+        $stopped = $response->status() === 404 ? VideoJob::CANCELLED : $response->json('status');
+        if (in_array($stopped, [VideoJob::CANCELLED, VideoJob::REVIEW], true)) {
+            $job->markStopped($stopped);
+        } elseif (! $response->successful()) {
+            $job->update(['cancel_requested' => false]);
+
+            return $response->status() === 409 ? null : $this->workerError($response);
+        }
+
+        return null;
+    }
+
+    /**
+     * Ask the worker to delete a job. Returns why it could not, or null. A job it no longer has is
+     * already gone, like one the weekly cleanup got to first.
+     */
+    private function deleteOnWorker(VideoJob $job): ?string
+    {
+        try {
+            $response = Worker::client()->delete("/jobs/{$job->worker_job_id}");
+        } catch (ConnectionException) {
+            return Worker::UNREACHABLE;
+        }
+
+        return $response->successful() || $response->status() === 404 ? null : $this->workerError($response);
     }
 
     /**
@@ -293,18 +379,24 @@ class VideoJobController extends Controller
     private function statusData(VideoJob $job): array
     {
         $version = $job->updated_at?->timestamp; // a remade video gets a new address, so no browser shows the old one
+        $cancelling = $job->isRunning() && $job->cancel_requested;
 
         return [
             'id' => $job->id,
             'name' => $job->original_name,
             'status' => $job->status,
             'progress' => $job->progress,
-            'message' => $job->message ? __($job->message) : null, // stored in English
+            'message' => $cancelling ? __('Cancelling') : ($job->message ? __($job->message) : null), // stored in English
+            'step_done' => $cancelling ? null : $job->step_done,
+            'step_total' => $cancelling ? null : $job->step_total,
             'error' => $job->error ? __($job->error) : null, // known messages have Khmer
             'language' => $job->language,
             'language_name' => $job->languageName(),
             'dub' => $job->dub,
             'status_url' => route('dub.status', $job),
+            'cancel_url' => $job->isRunning() && ! $cancelling && $job->progress < 99 ? route('dub.cancel', $job) : null, // at 99 only the download is left
+            'cancel_keeps_edits' => $job->language !== null, // known once the Khmer is ready, so past any review
+            'delete_url' => $job->isRunning() ? null : route('dub.destroy', $job),
             'review_url' => $job->status === VideoJob::REVIEW ? route('dub.review', $job) : null,
             'edit_url' => $job->status === VideoJob::DONE && $job->canEdit() ? route('dub.review', $job) : null,
             'srt_url' => $job->srt_path ? route('dub.download', [$job, 'srt']) : null,

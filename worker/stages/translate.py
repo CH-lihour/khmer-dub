@@ -2,6 +2,7 @@
 
 import functools
 import logging
+from collections.abc import Callable
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -43,13 +44,14 @@ WHISPER_TO_NLLB: dict[str, str] = {
 }
 
 
-def translate(segments: list[dict], src_lang: str) -> list[dict]:
+def translate(segments: list[dict], src_lang: str, on_step: Callable[[int, int], None] | None = None) -> list[dict]:
     """Fill `km` with the Khmer translation of `text` for every segment and return the segments.
 
     `src_lang` is the Whisper language code. Khmer sources are copied without loading the model, but
     only lines really written in Khmer: Whisper knows when speech is Khmer, yet writes it as garbage
-    in other scripts. Raises StageError if that leaves nothing, if no line came out in Khmer, for a
-    language NLLB-200 does not cover, or if the model cannot be loaded.
+    in other scripts. `on_step(done, total)` reports the lines translated so far. Raises StageError
+    if that leaves nothing, if no line came out in Khmer, for a language NLLB-200 does not cover, or
+    if the model cannot be loaded.
     """
     if src_lang == "km":
         for seg in segments:
@@ -69,6 +71,8 @@ def translate(segments: list[dict], src_lang: str) -> list[dict]:
         batch = todo[start:start + BATCH_SIZE]
         for seg, km in zip(batch, _translate_batch([seg["text"] for seg in batch], src_code), strict=True):
             seg["km"] = km.strip()
+        if on_step:
+            on_step(min(start + BATCH_SIZE, len(todo)), len(todo))
     if not any(is_khmer(seg["km"]) for seg in segments):
         raise StageError(NO_KHMER)
     log.info("Translated %d segments from %s to %s", len(todo), src_code, TARGET)

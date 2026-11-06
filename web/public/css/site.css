@@ -195,8 +195,8 @@ html[lang=km] h1, html[lang=km] h2 { line-height: 1.5; letter-spacing: 0; }
 
 /* The job being followed: the cloth grows as the work goes on */
 .job { position: relative; margin-top: -1.5rem; }
-.row { display: flex; justify-content: space-between; gap: 1rem; align-items: baseline; }
-.row h2 { margin: 0; }
+.row { display: flex; justify-content: space-between; gap: 1rem; align-items: center; }
+.row h2 { flex: 1; margin: 0; }
 .percent { font-size: 1.5rem; font-weight: 700; color: var(--lotus); font-variant-numeric: tabular-nums; }
 .bar { height: 1.5rem; background: var(--well); border-radius: 99px; overflow: hidden; margin: .6rem 0 .8rem; }
 .bar span {
@@ -205,15 +205,75 @@ html[lang=km] h1, html[lang=km] h2 { line-height: 1.5; letter-spacing: 0; }
 }
 .bar.processing span, .bar.queued span { animation: weave 1.2s linear infinite; }
 .bar.failed span { background: var(--lotus); }
+.bar.cancelled span { background: var(--ink-soft); }
 @keyframes weave { to { background-position: 24px 0; } }
 .job-message { font-weight: 600; margin: 0; }
+button.now-step {
+    display: flex; align-items: center; gap: .6rem; width: 100%; padding: .4rem .55rem; margin-left: -.55rem; box-sizing: content-box;
+    border-radius: 10px; background: none; color: var(--ink); box-shadow: none; font-size: 1rem; font-weight: 400; text-align: left;
+    transition: background-color .15s ease;
+}
+button.now-step:hover, button.now-step:active { background: var(--well); box-shadow: none; transform: none; }
+button.now-step:disabled { background: none; opacity: 1; cursor: default; }
+button.now-step:focus-visible { outline: 3px solid var(--lotus); outline-offset: 2px; }
+.now-step small { margin-left: auto; color: var(--ink-soft); font-size: .875rem; font-variant-numeric: tabular-nums; }
+.now-step:not(:disabled)::after { content: "›"; flex: none; width: 1rem; margin-left: .15rem; color: var(--ink-soft); font-size: 1.25rem; line-height: 1; text-align: center; transition: transform .25s ease; }
+.now-step:has(small:empty)::after { margin-left: auto; }
+.now-step[aria-expanded=true]::after { transform: rotate(90deg); }
+.fold { display: grid; grid-template-rows: 0fr; visibility: hidden; transition: grid-template-rows .25s ease, visibility 0s .25s; }
+.fold.open { grid-template-rows: 1fr; visibility: visible; transition-delay: 0s; }
+.fold .steps { min-height: 0; overflow: hidden; }
+.steps { display: grid; align-content: start; gap: .45rem; margin: 0; padding: 0; list-style: none; }
+.fold.open .steps { padding-top: .5rem; }
+.steps li { display: flex; align-items: center; gap: .6rem; color: var(--ink-soft); opacity: .6; transition: color .25s ease, opacity .25s ease; }
+.steps li::before, .now-step:not(:disabled)::before {
+    content: ""; display: grid; place-items: center; flex: none; width: 1.25rem; height: 1.25rem; border: 2px solid var(--line); border-radius: 50%;
+    font-size: .7rem; font-weight: 700; line-height: 1; transition: background-color .25s ease, border-color .25s ease;
+}
+.steps li.done { opacity: 1; }
+.steps li.done::before { content: "✓"; border-color: var(--jade); background: var(--jade); color: var(--jade-ink); }
+.steps li.now { color: var(--ink); font-weight: 600; opacity: 1; }
+.steps li.now::before, .now-step.now::before { border-top-color: var(--lotus); animation: spin .8s linear infinite; }
+.steps li.failed { color: var(--lotus); font-weight: 600; opacity: 1; }
+.steps li.failed::before, .now-step.failed::before { content: "✕"; border-color: var(--lotus); background: var(--lotus); color: var(--lotus-ink); }
+.now-step.failed .job-message { color: var(--lotus); }
+.steps li.cancelled { color: var(--ink); font-weight: 600; opacity: 1; }
+.steps li.cancelled::before, .now-step.cancelled::before { content: "✕"; border-color: var(--ink-soft); color: var(--ink-soft); }
+.now-step.waiting::before { border-color: var(--sun); }
+@keyframes spin { to { transform: rotate(360deg); } }
 .job .error { color: var(--lotus); font-weight: 600; margin: .5rem 0 0; }
 .player { display: block; width: 100%; max-height: 70vh; margin-top: 1rem; border-radius: 12px; background: #000000; }
 .job, .player { animation: appear .45s ease both; }
+.job.closing { animation: vanish .2s ease both; }
 @keyframes appear { from { opacity: 0; transform: translateY(.75rem); } }
+@keyframes vanish { to { opacity: 0; transform: translateY(.75rem); } }
+button.close {
+    flex: none; width: 2.25rem; height: 2.25rem; padding: 0; border-radius: 50%; background: var(--well); color: var(--ink-soft);
+    font-size: 1.35rem; line-height: 1; box-shadow: none; transition: background-color .15s ease, color .15s ease, transform .15s ease;
+}
+button.close:hover { background: var(--bad-bg); color: var(--lotus); box-shadow: none; transform: rotate(90deg); }
+button.close:active { box-shadow: none; transform: rotate(90deg) scale(.9); }
+button.close:focus-visible { outline: 3px solid var(--lotus); outline-offset: 2px; }
 .player::cue { font-family: "Kantumruy Pro", "Khmer UI", "Noto Sans Khmer", sans-serif; }
 .links { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
-.links:not(:has(a:not([hidden]))) { display: none; }
+.links:not(:has(> :not([hidden]))) { display: none; }
+#job-delete { margin-left: auto; }
+
+/* The question before stopping a job */
+.modal {
+    width: min(26rem, calc(100vw - 2rem)); padding: 0; border: 2px solid var(--line); border-radius: 24px;
+    background: var(--panel); color: var(--ink); box-shadow: var(--shadow);
+}
+.modal[open] { animation: appear .2s ease both; }
+.modal::backdrop { background: rgb(26 19 64 / .6); animation: fade .2s ease both; }
+.modal form { padding: 1.5rem; }
+.modal h2 { margin: 0 0 .5rem; font-size: 1.25rem; }
+.modal p { margin: 0; color: var(--ink-soft); overflow-wrap: anywhere; }
+.modal .modal-name { margin-bottom: .35rem; color: var(--ink); font-weight: 600; }
+.modal .error { margin-top: .5rem; color: var(--lotus); font-weight: 600; }
+.modal button.quiet { padding: .7rem 1rem; font-size: 1rem; }
+.modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: .75rem; margin-top: 1.25rem; }
+@keyframes fade { from { opacity: 0; } }
 
 /* Your videos */
 .videos { padding-top: 2rem; padding-bottom: 2rem; }
@@ -227,9 +287,12 @@ td a { color: var(--ink); }
 .s-done { background: var(--ok-bg); }
 .s-review { background: var(--sun-bg); }
 .s-failed { background: var(--bad-bg); }
+.s-cancelled { background: var(--well); }
 td.results { text-align: right; white-space: nowrap; }
 .results a { display: inline-block; padding: .05rem .6rem; border: 2px solid var(--line); border-radius: 99px; font-size: .875rem; text-decoration: none; color: var(--lotus); }
 .results a:hover { border-color: var(--lotus); }
+.results button { padding: .05rem .4rem; font-size: .875rem; }
+tr.closing { animation: vanish .2s ease both; }
 .empty { color: var(--ink-soft); }
 .small-print { font-size: .875rem; color: var(--ink-soft); max-width: 42rem; padding-bottom: 2.5rem; }
 

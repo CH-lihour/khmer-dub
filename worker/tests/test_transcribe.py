@@ -145,9 +145,12 @@ def test_segment_edges_match_speech(two_sentence_video: tuple, tmp_path: Path) -
 def test_transcribes_english_speech(speech_video: Path, tmp_path: Path) -> None:
     wav_path = tmp_path / "speech.wav"
     extract_audio(speech_video, wav_path)
-    segments, language = transcribe(wav_path)
+    steps: list[tuple[int, int]] = []
+    segments, language = transcribe(wav_path, lambda done, total: steps.append((done, total)))
 
     assert language == "en"
+    assert steps and all(0 <= done <= total for done, total in steps)
+    assert [done for done, _ in steps] == sorted(done for done, _ in steps)
     assert [seg["id"] for seg in segments] == list(range(len(segments)))
     assert all(seg["text"] and seg["start"] < seg["end"] for seg in segments)
     # Times are on the video's clock, not shifted by the silence the VAD removed.

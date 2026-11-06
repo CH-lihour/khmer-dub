@@ -1,11 +1,13 @@
 """HTTP endpoints of the dubbing worker, exactly as in the API contract of CLAUDE.md.
 
     POST /jobs                       multipart file, gender, dub, review, original_volume -> {"job_id": "<hex>"}
-    GET  /jobs/{id}                  -> {"status", "progress", "message", "error", "language"}
+    GET  /jobs/{id}                  -> {"status", "progress", "message", "error", "language", "done", "total"}
     GET  /jobs/{id}/segments         -> {"segments": [...]}, while the job is in review or done
     PUT  /jobs/{id}/segments         JSON {"segments": [{"id", "km"}], "gender", "original_volume"}
                                      -> saves the Khmer and the choices, and resumes
     POST /jobs/{id}/reopen           multipart file (the original video) -> puts a done job back in review
+    POST /jobs/{id}/cancel           -> {"status": ...}, stops a queued or running job
+    DELETE /jobs/{id}                -> {"status": "deleted"}, deletes a stopped job and its folder
     GET  /jobs/{id}/download/srt     -> khmer.srt
     GET  /jobs/{id}/download/video   -> dubbed.mp4
     POST /cleanup                    form days (default 7) -> {"deleted": <count>}
@@ -16,6 +18,8 @@ status.json next to its results, so finished jobs survive a restart of the worke
 review=true stops after translation with status "review", holding no thread, until its Khmer is saved.
 A finished job can come back to "review" with POST /jobs/{id}/reopen, to make its results again from
 edited Khmer. The upload was tidied away when it finished, so Laravel sends the video again.
+A job in line is cancelled at once, and a running one at its next progress report. It ends as
+"cancelled", or, past its review, waits in "review" again so the reviewer's work is kept.
 """
 
 import hmac
@@ -27,7 +31,7 @@ import secrets
 import shutil
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -49,7 +53,7 @@ log = logging.getLogger("worker")
 
 FORMATS = (".mp4", ".mov", ".mkv", ".webm")
 DUB_VALUES = {"true": True, "1": True, "false": False, "0": False}
-PUBLIC_FIELDS = ("status", "progress", "message", "error", "language")
+PUBLIC_FIELDS = ("status", "progress", "message", "error", "language", "done", "total")
 JOB_ID = re.compile(r"[0-9a-f]{32}")
 WRONG_TOKEN = "Wrong or missing x-token. It must equal WORKER_TOKEN in worker/.env and DUBBER_TOKEN in web/.env."
 UNEXPECTED = "Something went wrong while processing the video. The worker log has the details."
@@ -60,6 +64,8 @@ REVIEW_MESSAGE = "Waiting for your review"
 NOT_IN_REVIEW = "This job is not waiting for review."
 NOT_EDITABLE = "This job cannot be edited now. Only a finished job or one waiting for review can."
 NO_LINES = "This job has no saved lines to edit. Please upload the video again."
+NOT_RUNNING = "This job is not queued or running, so there is nothing to cancel."
+STILL_RUNNING = "This job is still queued or running. Cancel it first."
 MAX_LINE_CHARS = 2000
 
 
@@ -78,6 +84,10 @@ class Edits(BaseModel):
     original_volume: float | None = Field(default=None, ge=0, le=1)
 
 
+class Cancelled(Exception):
+    """Raised from a job's progress report to stop the pipeline there."""
+
+
 class JobStore:
     """Job state in a dictionary, mirrored to WORK_DIR/<id>/status.json, and the one worker thread."""
 
@@ -86,6 +96,8 @@ class JobStore:
         self._jobs: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="job")
+        self._futures: dict[str, Future] = {}  # what is in line or running on the thread, by job
+        self._cancelling: set[str] = set()  # running jobs to stop at their next progress report
         self._load()
 
     def new_folder(self) -> tuple[str, Path]:
@@ -104,7 +116,7 @@ class JobStore:
         with self._lock:
             self._jobs[job_id] = job
         self.update(job_id)
-        self._executor.submit(self._run, job_id)
+        self._futures[job_id] = self._executor.submit(self._run, job_id)
 
     def get(self, job_id: str) -> dict | None:
         """Return a copy of the job's state, or None for an unknown id."""
@@ -147,7 +159,33 @@ class JobStore:
             choices = {"gender": edits.gender, "original_volume": edits.original_volume}
             self._set(job_id, status="queued", message="Waiting in the queue", error=None,
                       **{key: value for key, value in choices.items() if value is not None})
-        self._executor.submit(self._finish, job_id)
+        self._futures[job_id] = self._executor.submit(self._finish, job_id)
+
+    def cancel(self, job_id: str) -> str:
+        """Stop a queued or running job and return its status now. Answers 409 for any other job.
+
+        A job still in line stops at once. A running job stays "processing" until its next progress
+        report, so the answer does not always mean it has stopped.
+        """
+        with self._lock:
+            job = self._jobs[job_id]
+            if job["status"] not in ("queued", "processing"):
+                raise HTTPException(409, NOT_RUNNING)
+            future = self._futures.get(job_id)
+            if future is None or not future.cancel():
+                self._cancelling.add(job_id)
+                return job["status"]
+        self._stopped(job_id)
+        return self.get(job_id)["status"]
+
+    def delete(self, job_id: str) -> None:
+        """Forget a stopped job and delete its folder. Answers 409 for a queued or running job."""
+        with self._lock:
+            if self._jobs[job_id]["status"] in ("queued", "processing"):
+                raise HTTPException(409, STILL_RUNNING)
+            del self._jobs[job_id]
+        shutil.rmtree(self.work_dir / job_id, ignore_errors=True)
+        log.info("Job %s deleted", job_id)
 
     def cleanup(self, days: float) -> list[str]:
         """Delete the folders of finished jobs created more than `days` days ago; return their ids.
@@ -187,7 +225,7 @@ class JobStore:
         def work() -> None:
             if job.get("review"):
                 prepared = pipeline.prepare(folder, video, progress)
-                self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, **prepared)
+                self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, done=None, total=None, **prepared)
             else:
                 result = pipeline.run(folder, video, job["gender"], job["dub"], progress, job.get("original_volume"))
                 self._done(job_id, job["upload"], result)
@@ -207,12 +245,14 @@ class JobStore:
         # the job waits in review again, with the error, and saving retries it.
         self._attempt(job_id, work, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE)
 
-    def _reporter(self, job_id: str) -> Callable[[int, str], None]:
+    def _reporter(self, job_id: str) -> Callable[..., None]:
         """A pipeline progress callback that marks the job as processing."""
         self.update(job_id, status="processing", message="Starting")
 
-        def progress(percent: int, message: str) -> None:
-            self.update(job_id, progress=percent, message=message)
+        def progress(percent: int, message: str, done: int | None = None, total: int | None = None) -> None:
+            if job_id in self._cancelling:
+                raise Cancelled
+            self.update(job_id, progress=percent, message=message, done=done, total=total)
 
         return progress
 
@@ -221,18 +261,33 @@ class JobStore:
         failed = on_failure or {"status": "failed", "message": "Failed"}
         try:
             work()
+        except Cancelled:
+            self._stopped(job_id)
         except StageError as exc:
             log.warning("Job %s failed: %s", job_id, exc)
             self.update(job_id, **failed, error=str(exc))
         except Exception:
             log.exception("Job %s crashed", job_id)
             self.update(job_id, **failed, error=UNEXPECTED)
+        finally:
+            self._cancelling.discard(job_id)
+            self._futures.pop(job_id, None)
+
+    def _stopped(self, job_id: str) -> None:
+        """Record that a job was cancelled. Past its review it waits there again, keeping the edits."""
+        job = self.get(job_id)
+        log.info("Job %s cancelled", job_id)
+        if "duration" in job:
+            self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, error=None, done=None, total=None)
+        else:
+            _tidy(self.work_dir / job_id, job["upload"])
+            self.update(job_id, status="cancelled", message="Cancelled", done=None, total=None)
 
     def _done(self, job_id: str, upload: str, result: dict) -> None:
         """Tidy the job's folder and record its results."""
         _tidy(self.work_dir / job_id, upload)
         video = Path(result["video"]).name if result["video"] else None
-        self.update(job_id, status="done", progress=100, message="Done", error=None,
+        self.update(job_id, status="done", progress=100, message="Done", error=None, done=None, total=None,
                     language=result["language"], srt=Path(result["srt"]).name, video=video)
         log.info("Job %s done", job_id)
 
@@ -349,10 +404,20 @@ def job_status(job_id: str, request: Request) -> dict:
     """Return the job's status, progress (0 to 100), current step message, error and language.
 
     `error` is null unless something failed. `language` is the Whisper code of the detected spoken
-    language (for example "en"), or null until the Khmer is ready (status review or done).
+    language (for example "en"), or null until the Khmer is ready (status review or done). `done`
+    and `total` say how far the current step is, or are null: seconds of the video while
+    transcribing, lines while translating or making the voice.
     """
     job = _find(request, job_id)
     return {key: job.get(key) for key in PUBLIC_FIELDS}  # .get: status.json files from before "language"
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str, request: Request) -> dict[str, str]:
+    """Delete a stopped job with everything in its folder. Answers 409 for a queued or running job."""
+    _find(request, job_id)
+    request.app.state.jobs.delete(job_id)
+    return {"status": "deleted"}
 
 
 @app.get("/jobs/{job_id}/segments")
@@ -409,6 +474,17 @@ def reopen_job(job_id: str, request: Request, file: Annotated[UploadFile | None,
                 upload=upload.name, duration=duration)
     log.info("Job %s reopened for editing", job_id)
     return {"status": "review"}
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, request: Request) -> dict[str, str]:
+    """Stop a queued or running job and return its status now.
+
+    "cancelled" or "review" means it has stopped; "queued" or "processing" means it stops at its next
+    step, so keep reading GET /jobs/{id}. Answers 409 for a job that is not queued or running.
+    """
+    _find(request, job_id)
+    return {"status": request.app.state.jobs.cancel(job_id)}
 
 
 @app.get("/jobs/{job_id}/download/srt")

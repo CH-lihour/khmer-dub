@@ -60,9 +60,11 @@ def test_translates_in_batches_and_skips_empty_text(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(translate_module, "_translate_batch", fake_batch)
     texts = [f"line {i}" for i in range(29)]
     texts[3] = "  "
-    result = translate(segments(*texts), "ja")
+    steps: list[tuple[int, int]] = []
+    result = translate(segments(*texts), "ja", lambda done, total: steps.append((done, total)))
 
     assert calls == [(12, "jpn_Jpan"), (12, "jpn_Jpan"), (4, "jpn_Jpan")]
+    assert steps == [(12, 28), (24, 28), (28, 28)]
     assert result[0]["km"] == "ក:line 0"
     assert result[3]["km"] == ""
     assert result[28]["km"] == "ក:line 28"

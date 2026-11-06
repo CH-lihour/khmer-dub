@@ -179,9 +179,11 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 | Call | Answer |
 | --- | --- |
 | `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`) | `{"job_id": "<32 hex>"}` |
-| `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language"}` |
+| `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language", "done", "total"}` |
 | `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` or `done` |
 | `POST /jobs/{id}/reopen` (multipart `file`, the original video) | `{"status": "review"}`, to make a done job's results again |
+| `POST /jobs/{id}/cancel` | `{"status": <status now>}`, to stop a queued or running job |
+| `DELETE /jobs/{id}` | `{"status": "deleted"}`, to delete a stopped job and its folder |
 | `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km"}]}`, optional `gender`, `original_volume`) | `{"status": "queued"}`; saves the Khmer and choices and resumes the job |
 | `GET /jobs/{id}/download/srt` | `khmer.srt` |
 | `GET /jobs/{id}/download/video` | `dubbed.mp4` (only for `dub=true`) |
@@ -199,6 +201,11 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
   `ORIGINAL_VOLUME` when they are left out.
 - The review calls answer 409 for a job that is not in `review`, so saving twice cannot run it twice.
   `reopen` answers 409 for a running or failed job, or one with no saved lines.
+- `DELETE /jobs/{id}` answers 409 for a job that is queued or running.
+- `cancel` answers 409 for a job that is not queued or running. A job in line stops at once. A
+  running one stops at its next progress report. That is within a few seconds while making the
+  voice, but it can take a model load, or a batch of 12 lines while translating (about 20 seconds
+  in a test on CPU). Mixing finishes the step it is on first.
 - Jobs run one at a time on one worker thread, in upload order. Later uploads wait as `queued`.
 - Each job lives in `/data/jobs/<id>/` (the `worker_jobs` volume) with a `status.json`. After a
   restart, finished jobs can still be downloaded. A job that was queued or running when the
@@ -258,6 +265,19 @@ the key, and a text with no Khmer entry shows in English. A test fails if a page
    downloads the results into `web/storage/app/private/results/<id>/` (`khmer.srt`, and
    `dubbed.mp4` when dubbing). Laravel 13 keeps its private files under
    `storage/app/private/`, not `storage/app/`.
+   While it runs, the job's card shows the current step and how far it is: the time reached in the
+   video while transcribing, and lines while translating and making the voice. The worker reports
+   these as `done` and `total`. Click the step to unfold the list of all steps, where finished ones
+   have a tick and a failed one a cross.
+   **Cancel** asks first in a dialog that says what happens to the work so far, and **Keep going**,
+   Esc or a click outside it leaves the job running. After **Yes, stop**, the card says
+   **Cancelling** until it has stopped. A new job ends as **Cancelled**, and you upload the video again to redo it. A job past
+   its review goes back to review instead, with your edits and any older video kept. Downloading
+   the results can no longer be cancelled.
+   **Delete**, on the job's card and on each row of **Your videos**, removes a stopped video for
+   good after you confirm: its upload, its results, its row and its folder on the worker. There is
+   no undo. A running video has no Delete, so cancel it first. If the worker cannot be reached,
+   nothing is deleted and the dialog says why, so no copy stays behind.
 3. The page reads `GET /dub/<id>/status` and offers `GET /dub/<id>/download/srt` and `/video`.
    The downloads are named after the upload, for example `my-talk-khmer.mp4`.
 4. When a job has a dubbed video, the page plays it in a player with the Khmer subtitles, which
@@ -266,7 +286,8 @@ the key, and a text with no Khmer entry shows in English. A test fails if a page
    Every dubbed video under **Your videos** has a **Play** button that opens it in the player, for
    as long as its files are kept. **Play** and the video's name both stay on the page and glide to
    the player over 0.7 s, and so does coming back from the edit page. A device set to reduce
-   motion goes straight there. A subtitles-only job has no player. If a browser cannot play the video's codec (MP4 keeps the
+   motion goes straight there. The **×** on the video's card stops it, closes the card and goes
+   back to the video in the list. A subtitles-only job has no player. If a browser cannot play the video's codec (MP4 keeps the
    upload's codec), the page says so and the download still works.
 
 A failed job shows the reason: the worker's own message (no speech, too long, voice service

@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -20,11 +21,11 @@ def fake_stages(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("audio")
         return 60.0
 
-    def transcribe(wav_path: Path) -> tuple[list[dict], str]:
+    def transcribe(wav_path: Path, on_step: Callable | None = None) -> tuple[list[dict], str]:
         calls.append("transcribe")
         return [{"id": 0, "start": 1.0, "end": 2.5, "text": "Hello"}], "en"
 
-    def translate(segments: list[dict], src_lang: str) -> list[dict]:
+    def translate(segments: list[dict], src_lang: str, on_step: Callable | None = None) -> list[dict]:
         calls.append(f"translate:{src_lang}")
         segments[0]["km"] = "សួស្តី"
         return segments
@@ -48,7 +49,7 @@ def test_subtitles_only(fake_stages: list[str], tmp_path: Path) -> None:
 
 
 def test_stage_error_stops_the_run(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_speech(wav_path: Path) -> tuple[list[dict], str]:
+    def no_speech(wav_path: Path, on_step: Callable | None = None) -> tuple[list[dict], str]:
         raise StageError("No speech was found in the video.")
 
     monkeypatch.setattr(pipeline, "transcribe", no_speech)
@@ -60,7 +61,7 @@ def test_stage_error_stops_the_run(fake_stages: list[str], tmp_path: Path, monke
 
 
 def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def synth_all(segments: list[dict], folder: Path, gender: str) -> list[dict]:
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None) -> list[dict]:
         fake_stages.append(f"voice:{gender}")
         return segments
 
@@ -84,6 +85,31 @@ def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.Mon
     assert result["srt"].exists()
 
 
+def test_long_stages_report_how_far_they_are(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable) -> list[dict]:
+        on_step(1, 4)
+        on_step(4, 4)
+        return segments
+
+    def transcribe(wav_path: Path, on_step: Callable) -> tuple[list[dict], str]:
+        on_step(30, 60)
+        return [{"id": 0, "start": 1.0, "end": 2.5, "text": "Hello"}], "en"
+
+    monkeypatch.setattr(pipeline, "transcribe", transcribe)
+    monkeypatch.setattr(pipeline, "synth_all", synth_all)
+    monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
+    reports: list[tuple] = []
+
+    pipeline.run(tmp_path / "job", "in.mp4", "female", True, lambda *report: reports.append(report))
+
+    assert (29, "Transcribing speech", 30, 60) in reports
+    assert (66, "Making the Khmer voice", 1, 4) in reports
+    assert (84, "Making the Khmer voice", 4, 4) in reports
+    percents = [report[0] for report in reports]
+    assert percents == sorted(percents), "the bar never goes back"
+
+
 def test_making_a_job_again_forgets_the_voice_of_an_emptied_line(
     fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -99,7 +125,7 @@ def test_making_a_job_again_forgets_the_voice_of_an_emptied_line(
         placed.extend(seg.get("clip") for seg in segments)
         return folder / "dub.wav"
 
-    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender: segments)
+    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step: segments)
     monkeypatch.setattr(pipeline, "build_track", build_track)
     monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
 
@@ -114,7 +140,7 @@ def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voic
 ) -> None:
     voiced: list[str] = []
 
-    def synth_all(segments: list[dict], folder: Path, gender: str) -> list[dict]:
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None) -> list[dict]:
         voiced.extend(seg["km"] for seg in segments)
         return segments
 
@@ -142,7 +168,7 @@ def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voic
 
 @pytest.mark.models
 def test_real_video_to_khmer_srt(speech_video: Path, tmp_path: Path) -> None:
-    result = pipeline.run(tmp_path / "job", speech_video, "female", False, lambda p, m: None)
+    result = pipeline.run(tmp_path / "job", speech_video, "female", False, lambda *report: None)
 
     srt = result["srt"].read_text(encoding="utf-8")
     first_time = re.search(r"^(\d\d):(\d\d):(\d\d),(\d{3}) --> ", srt, re.MULTILINE)
@@ -155,7 +181,7 @@ def test_real_video_to_khmer_srt(speech_video: Path, tmp_path: Path) -> None:
 @pytest.mark.models
 def test_real_video_dubbed(speech_video: Path, tmp_path: Path) -> None:
     try:
-        result = pipeline.run(tmp_path / "job", speech_video, "female", True, lambda p, m: None)
+        result = pipeline.run(tmp_path / "job", speech_video, "female", True, lambda *report: None)
     except StageError as exc:
         pytest.skip(f"edge-tts unreachable: {exc}")
 

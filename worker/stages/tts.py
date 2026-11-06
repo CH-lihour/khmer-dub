@@ -5,6 +5,7 @@ import logging
 import subprocess
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 
 import edge_tts
@@ -59,12 +60,18 @@ def synth(text: str, out_path: str | Path, gender: str) -> Path:
     return out_path
 
 
-def synth_all(segments: list[dict], folder: str | Path, gender: str) -> list[dict]:
-    """Write one clip per segment to `folder/<id>.wav` and set its `clip`. Skips segments with empty `km`."""
+def synth_all(segments: list[dict], folder: str | Path, gender: str,
+              on_step: Callable[[int, int], None] | None = None) -> list[dict]:
+    """Write one clip per segment to `folder/<id>.wav` and set its `clip`. Skips segments with empty `km`.
+
+    `on_step(done, total)` reports the lines voiced so far.
+    """
     folder = Path(folder)
-    for seg in segments:
-        if seg.get("km", "").strip():
-            seg["clip"] = str(synth(seg["km"], folder / f"{seg['id']}.wav", gender))
+    todo = [seg for seg in segments if seg.get("km", "").strip()]
+    for done, seg in enumerate(todo, start=1):
+        seg["clip"] = str(synth(seg["km"], folder / f"{seg['id']}.wav", gender))
+        if on_step:
+            on_step(done, len(todo))
     return segments
 
 

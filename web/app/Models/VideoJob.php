@@ -22,11 +22,14 @@ use Locale;
  * @property string $status
  * @property int $progress
  * @property string|null $message
+ * @property int|null $step_done
+ * @property int|null $step_total
  * @property string|null $language
  * @property string|null $worker_job_id
  * @property string|null $srt_path
  * @property string|null $video_path
  * @property string|null $error
+ * @property bool $cancel_requested
  */
 class VideoJob extends Model
 {
@@ -41,10 +44,12 @@ class VideoJob extends Model
 
     public const FAILED = 'failed';
 
+    public const CANCELLED = 'cancelled';
+
     /** @var list<string> */
     protected $fillable = [
         'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'original_volume', 'status', 'progress',
-        'message', 'language', 'worker_job_id', 'srt_path', 'video_path', 'error',
+        'message', 'step_done', 'step_total', 'language', 'worker_job_id', 'srt_path', 'video_path', 'error', 'cancel_requested',
     ];
 
     /** @var array<string, mixed> */
@@ -55,6 +60,7 @@ class VideoJob extends Model
         'original_volume' => 0,
         'status' => self::QUEUED,
         'progress' => 0,
+        'cancel_requested' => false,
     ];
 
     /**
@@ -62,7 +68,7 @@ class VideoJob extends Model
      */
     protected function casts(): array
     {
-        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'progress' => 'integer'];
+        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'progress' => 'integer', 'step_done' => 'integer', 'step_total' => 'integer', 'cancel_requested' => 'boolean'];
     }
 
     /**
@@ -106,7 +112,37 @@ class VideoJob extends Model
      */
     public function isFinished(): bool
     {
-        return in_array($this->status, [self::DONE, self::FAILED], true);
+        return in_array($this->status, [self::DONE, self::FAILED, self::CANCELLED], true);
+    }
+
+    /**
+     * Whether the job is waiting or being worked on, so it can be cancelled.
+     */
+    public function isRunning(): bool
+    {
+        return in_array($this->status, [self::QUEUED, self::PROCESSING], true);
+    }
+
+    /**
+     * End a job that the queue has not started, in one step so the queue cannot start it meanwhile.
+     * Returns false for any other job.
+     */
+    public function cancelUnsent(): bool
+    {
+        return self::whereKey($this->id)->where('status', self::QUEUED)->whereNull('worker_job_id')
+            ->update(['status' => self::CANCELLED, 'message' => 'Cancelled']) === 1;
+    }
+
+    /**
+     * Record that the worker has stopped this cancelled job: for good, or back at its review
+     * (self::REVIEW) with the edits kept, where an older video stays playable.
+     */
+    public function markStopped(string $status): void
+    {
+        $outcome = $status === self::REVIEW
+            ? ['status' => self::REVIEW, 'progress' => 50, 'message' => 'Waiting for your review']
+            : ['status' => self::CANCELLED, 'message' => 'Cancelled'];
+        $this->update([...$outcome, 'cancel_requested' => false, 'step_done' => null, 'step_total' => null]);
     }
 
     /**

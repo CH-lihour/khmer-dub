@@ -23,6 +23,8 @@ Route::middleware('auth')->group(function () {
         Route::post('/dub', 'store')->name('dub.store');
         Route::post('/dub/options', 'saveOptions')->name('dub.options');
         Route::get('/dub/{job}/status', 'status')->name('dub.status');
+        Route::post('/dub/{job}/cancel', 'cancel')->name('dub.cancel');
+        Route::delete('/dub/{job}', 'destroy')->name('dub.destroy');
         Route::get('/dub/{job}/review', 'review')->name('dub.review');
         Route::post('/dub/{job}/review', 'saveReview')->name('dub.review.save');
         Route::get('/dub/{job}/download/{kind}', 'download')->whereIn('kind', ['srt', 'video'])->name('dub.download');

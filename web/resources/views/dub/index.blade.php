@@ -1,8 +1,24 @@
 @php
-    $statusLabel = ['queued' => __('Queued'), 'processing' => __('Processing'), 'review' => __('Needs review'), 'done' => __('Done'), 'failed' => __('Failed')];
+    $statusLabel = ['queued' => __('Queued'), 'processing' => __('Processing'), 'review' => __('Needs review'), 'done' => __('Done'), 'failed' => __('Failed'), 'cancelled' => __('Cancelled')];
+    // What the job goes through. `from` is the progress at which a step starts (see the API contract).
+    $steps = [
+        ['from' => 0, 'label' => __('Sending the video to the worker')],
+        ['from' => 5, 'label' => __('Extracting audio')],
+        ['from' => 15, 'label' => __('Transcribing speech')],
+        ['from' => 45, 'label' => __('Translating to Khmer')],
+        ['from' => 60, 'label' => __('Making the Khmer voice'), 'voice' => true],
+        ['from' => 85, 'label' => __('Mixing and merging'), 'voice' => true],
+        ['from' => 99, 'label' => __('Downloading the results')],
+    ];
     $texts = [
         'uploading' => __('Uploading'),
+        'lines' => __(':done of :total lines'),
         'review' => __('Review'),
+        'cancelLost' => __('The work so far will be lost, and you will need to upload the video again.'),
+        'cancelKept' => __('You go back to the review with your edits. Any older video stays.'),
+        'delete' => __('Delete'),
+        'deleteName' => __('Delete :name'),
+        'noVideos' => __('No videos yet'),
         'off' => __('Off'),
         'play' => __('Play'),
         'justNow' => __('just now'),
@@ -57,12 +73,17 @@
             <div class="row">
                 <h2 id="job-name" class="name">{{ $current['name'] ?? '' }}</h2>
                 <span id="job-percent" class="percent">{{ isset($current) ? $current['progress'].'%' : '' }}</span>
+                <button id="job-close" class="close" type="button" aria-label="{{ __('Close the video') }}" title="{{ __('Close the video') }}" hidden>×</button>
             </div>
             <div id="job-bar" class="bar {{ $current['status'] ?? '' }}" role="progressbar" aria-label="{{ $current['message'] ?? '' }}"
                  aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ $current['progress'] ?? 0 }}">
                 <span style="width: {{ $current['progress'] ?? 0 }}%"></span>
             </div>
-            <p id="job-message" class="job-message">{{ $current['message'] ?? '' }}</p>
+            <button id="job-toggle" class="now-step" type="button" title="{{ __('Show all steps') }}" aria-expanded="false" aria-controls="job-fold">
+                <span id="job-message" class="job-message">{{ $current['message'] ?? '' }}</span>
+                <small id="job-count" aria-hidden="true"></small>
+            </button>
+            <div id="job-fold" class="fold"><ol id="job-steps" class="steps"></ol></div>
             <p id="job-error" class="error" @if (empty($current['error'])) hidden @endif>{{ $current['error'] ?? '' }}</p>
             <p id="job-language" class="hint" @if (empty($current['language_name'])) hidden @endif><b>{{ $current['language_name'] ?? '' }}</b></p>
             <video id="job-player" class="player" controls playsinline preload="metadata" hidden>
@@ -70,12 +91,38 @@
             </video>
             <p id="job-player-error" class="error" hidden>{{ __('This browser cannot play the video. Download it instead.') }}</p>
             <div class="links">
+                <button id="job-cancel" class="quiet" type="button" hidden>{{ __('Cancel') }}</button>
                 <a id="job-review" class="button sun" href="{{ $current['review_url'] ?? '#' }}" @if (empty($current['review_url'])) hidden @endif>{{ __('Check the Khmer') }}</a>
                 <a id="job-edit" class="button sun" href="{{ $current['edit_url'] ?? '#' }}" @if (empty($current['edit_url'])) hidden @endif>{{ __('Edit and regenerate') }}</a>
                 <a id="job-video" class="button" href="{{ $current['video_url'] ?? '#' }}" @if (empty($current['video_url'])) hidden @endif>↓ {{ __('Video') }}</a>
                 <a id="job-srt" class="button jade" href="{{ $current['srt_url'] ?? '#' }}" @if (empty($current['srt_url'])) hidden @endif>↓ {{ __('Subtitles') }}</a>
+                <button id="job-delete" class="quiet" type="button" hidden>{{ __('Delete') }}</button>
             </div>
         </section>
+
+        <dialog id="cancel-dialog" class="modal" aria-labelledby="cancel-title" aria-describedby="cancel-text">
+            <form method="dialog">
+                <h2 id="cancel-title">{{ __('Stop making this video?') }}</h2>
+                <p id="cancel-text"></p>
+                <div class="modal-actions">
+                    <button class="quiet" value="keep" autofocus>{{ __('Keep going') }}</button>
+                    <button id="cancel-confirm" class="danger" type="button">{{ __('Yes, stop') }}</button>
+                </div>
+            </form>
+        </dialog>
+
+        <dialog id="delete-dialog" class="modal" aria-labelledby="delete-title" aria-describedby="delete-name delete-text">
+            <form method="dialog">
+                <h2 id="delete-title">{{ __('Delete this video?') }}</h2>
+                <p id="delete-name" class="modal-name"></p>
+                <p id="delete-text">{{ __('The dubbed video, the subtitles and your edits will be gone for good.') }}</p>
+                <p id="delete-error" class="error" hidden></p>
+                <div class="modal-actions">
+                    <button class="quiet" value="keep" autofocus>{{ __('Keep it') }}</button>
+                    <button id="delete-confirm" class="danger" type="button">{{ __('Delete') }}</button>
+                </div>
+            </form>
+        </dialog>
 
         <section class="videos">
             <h2>{{ __('Your videos') }}</h2>
@@ -92,6 +139,7 @@
                                 @if ($job->status === 'review')<a href="{{ route('dub.review', $job) }}">{{ __('Review') }}</a>@endif
                                 @if ($job->srt_path)<a href="{{ route('dub.download', [$job, 'srt']) }}">SRT</a>@endif
                                 @if ($job->video_path)<a href="{{ route('dub.download', [$job, 'video']) }}">MP4</a>@endif
+                                @unless ($job->isRunning())<button class="quiet" type="button" data-delete-url="{{ route('dub.destroy', $job) }}" aria-label="{{ __('Delete :name', ['name' => $job->original_name]) }}">{{ __('Delete') }}</button>@endunless
                             </td>
                         </tr>
                     @empty
@@ -111,13 +159,15 @@
     <script>
     (() => {
         const STATUS = @json($statusLabel);
+        const STEPS = @json($steps);
         const TEXT = @json($texts);
         const POLL_MS = 3000;
         const GLIDE_MS = 700;
         const $ = (id) => document.getElementById(id);
         const form = $('upload'), start = $('start'), errors = $('errors'), video = $('video'), drop = $('drop');
         const level = $('original-volume'), dub = form.elements.dub;
-        let timer = null, glide = null, saving = false, changed = false;
+        const SEND_HEADERS = { Accept: 'application/json', 'X-CSRF-TOKEN': form.elements._token.value };
+        let timer = null, glide = null, saving = false, changed = false, deleting = null;
 
         function showErrors(list) {
             errors.replaceChildren(...list.map((text) => Object.assign(document.createElement('li'), { textContent: text })));
@@ -148,6 +198,7 @@
             player.dataset.url = url;
             player.pause();
             player.hidden = !url;
+            $('job-close').hidden = !url;
             $('job-player-error').hidden = true;
             $('job-subtitles').src = job.subtitles_url || '';
             if (url) player.src = url;
@@ -155,9 +206,47 @@
             player.load();
         }
 
+        /** "1:05" for a time in seconds. */
+        const clock = (seconds) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+
+        /** How far a step is: seconds of the video while transcribing, lines after that. */
+        function stepCount(job, step) {
+            if (job.step_total == null) return '';
+            if (step.from === 15) return `${clock(job.step_done)} / ${clock(job.step_total)}`;
+            return TEXT.lines.replace(':done', job.step_done).replace(':total', job.step_total);
+        }
+
+        /** Unfold or fold the list of steps under the current one. */
+        function foldSteps(open) {
+            $('job-toggle').setAttribute('aria-expanded', open);
+            $('job-fold').classList.toggle('open', open);
+        }
+
+        /** Show what a job is doing now and how far that is, and keep the full list up to date for unfolding. */
+        function showSteps(job) {
+            const list = $('job-steps'), toggle = $('job-toggle');
+            const state = { done: '', failed: 'failed', cancelled: 'cancelled', review: 'waiting' }[job.status] ?? 'now';
+            toggle.className = `now-step ${state}`;
+            toggle.disabled = job.status === 'done';
+            $('job-count').textContent = '';
+            if (toggle.disabled) return foldSteps(false);
+
+            const steps = STEPS.filter((step) => job.dub !== false || !step.voice);
+            if (list.children.length !== steps.length) {
+                list.replaceChildren(...steps.map((step) => Object.assign(document.createElement('li'), { textContent: step.label })));
+            }
+            const started = steps.findLastIndex((step) => step.from <= job.progress);
+            const now = job.status === 'review' ? started + 1 : started; // translated, and waiting for a person
+            [...list.children].forEach((item, i) => {
+                item.className = i < now ? 'done' : i > now || job.status === 'review' ? '' : state;
+            });
+            if (job.status === 'processing') $('job-count').textContent = stepCount(job, steps[now]);
+        }
+
         /** Draw a job (the JSON from the status route) in the progress card and in its history row. */
         function render(job) {
             $('job').hidden = false;
+            $('job').dataset.id = job.id ?? '';
             $('job-name').textContent = job.name;
             $('job-percent').textContent = `${job.progress}%`;
             const bar = $('job-bar');
@@ -166,11 +255,19 @@
             bar.setAttribute('aria-label', job.message || '');
             bar.firstElementChild.style.width = `${job.progress}%`;
             $('job-message').textContent = job.message || '';
+            showSteps(job);
             $('job-error').hidden = !job.error;
             $('job-error').textContent = job.error || '';
             $('job-language').hidden = !job.language_name;
             $('job-language').querySelector('b').textContent = job.language_name || '';
             showPlayer(job);
+            $('job-cancel').hidden = !job.cancel_url;
+            $('job-cancel').disabled = false;
+            $('job-cancel').dataset.url = job.cancel_url || '';
+            $('job-cancel').dataset.keepsEdits = job.cancel_keeps_edits ? 'yes' : '';
+            if (!job.cancel_url && $('cancel-dialog').open) $('cancel-dialog').close(); // it finished or failed meanwhile
+            $('job-delete').hidden = !job.delete_url;
+            $('job-delete').dataset.url = job.delete_url || '';
             for (const [id, url] of [['job-review', job.review_url], ['job-edit', job.edit_url], ['job-srt', job.srt_url], ['job-video', job.video_url]]) {
                 $(id).hidden = !url;
                 $(id).href = url || '#';
@@ -202,11 +299,18 @@
                 links[0].className = 'play';
                 links[0].dataset.statusUrl = job.status_url;
             }
-            row.querySelector('.results').replaceChildren(...links.flatMap((a) => [a, ' ']));
+            const results = links.flatMap((a) => [a, ' ']);
+            if (job.delete_url) {
+                const button = Object.assign(document.createElement('button'), { type: 'button', className: 'quiet', textContent: TEXT.delete });
+                button.dataset.deleteUrl = job.delete_url;
+                button.setAttribute('aria-label', TEXT.deleteName.replace(':name', job.name));
+                results.push(button);
+            }
+            row.querySelector('.results').replaceChildren(...results);
         }
 
         /** True once nothing will change until the user acts. */
-        const stopped = (status) => ['done', 'failed', 'review'].includes(status);
+        const stopped = (status) => ['done', 'failed', 'cancelled', 'review'].includes(status);
 
         /** Where the page must be scrolled to for `element` to be centred, or to show its top if it is too tall. */
         function centredAt(element) {
@@ -248,8 +352,117 @@
             }
         }
 
+        /** Stop the video and fold the card away, then do `then`. */
+        function hideCard(then) {
+            const card = $('job');
+            showPlayer({}); // stops the sound and the download
+            history.replaceState(null, '', location.pathname);
+            card.classList.add('closing');
+            setTimeout(() => {
+                card.classList.remove('closing');
+                card.hidden = true;
+                then?.();
+            }, 200);
+        }
+
+        /** Stop and close the video, and go back to its place in the history. */
+        function closeJob() {
+            const id = new URLSearchParams(location.search).get('job');
+            const link = document.querySelector(`#history tr[data-id="${id}"] a`);
+            hideCard(() => {
+                if (link) {
+                    link.focus({ preventScroll: true });
+                    glideTo(link.closest('tr'));
+                }
+            });
+        }
+
+        /** Ask whether to stop the job, saying what would happen to the work so far. */
+        function askToCancel() {
+            const dialog = $('cancel-dialog');
+            $('cancel-text').textContent = $('job-cancel').dataset.keepsEdits ? TEXT.cancelKept : TEXT.cancelLost;
+            dialog.showModal();
+        }
+
+        /** Stop the job. The card says so until it has stopped, which polling then shows. */
+        async function cancelJob() {
+            const button = $('job-cancel');
+            button.disabled = true;
+            let problem = TEXT.unreachable;
+            try {
+                const response = await fetch(button.dataset.url, { method: 'POST', headers: SEND_HEADERS });
+                const body = await response.json();
+                if (response.ok) {
+                    render(body);
+                    return $('job-toggle').focus({ preventScroll: true }); // the button that had it is gone
+                }
+                problem = body.message;
+            } catch (error) {
+                // the site could not be reached, as `problem` says
+            }
+            button.disabled = false;
+            $('job-error').hidden = false;
+            $('job-error').textContent = problem;
+        }
+
+        /** Ask whether to delete a job, naming it. */
+        function askToDelete(url, id, name) {
+            deleting = { url, id };
+            $('delete-name').textContent = name;
+            $('delete-error').hidden = true;
+            $('delete-confirm').disabled = false;
+            $('delete-dialog').showModal();
+        }
+
+        /** Delete the job. The dialog stays open until that has worked, and shows why if it has not. */
+        async function deleteJob() {
+            const button = $('delete-confirm');
+            button.disabled = true;
+            let problem = TEXT.unreachable;
+            try {
+                const response = await fetch(deleting.url, { method: 'DELETE', headers: SEND_HEADERS });
+                if (response.ok) {
+                    $('delete-dialog').close();
+                    return removeJob(deleting.id);
+                }
+                problem = (await response.json()).message;
+            } catch (error) {
+                // the site could not be reached, as `problem` says
+            }
+            button.disabled = false;
+            $('delete-error').hidden = false;
+            $('delete-error').textContent = problem;
+        }
+
+        /** Take a deleted job off the page: its card, if that is open, and its row in the history. */
+        function removeJob(id) {
+            const row = document.querySelector(`#history tr[data-id="${id}"]`);
+            const next = row?.nextElementSibling ?? row?.previousElementSibling;
+            if ($('job').dataset.id === String(id)) {
+                clearTimeout(timer);
+                hideCard();
+            }
+            row?.classList.add('closing');
+            setTimeout(() => {
+                row?.remove();
+                next?.querySelector('a')?.focus({ preventScroll: true }); // the button that had it is gone
+                if (!$('history').children.length) {
+                    const empty = Object.assign(document.createElement('td'), { className: 'empty', colSpan: 4, textContent: TEXT.noVideos });
+                    const none = document.createElement('tr');
+                    none.id = 'history-empty';
+                    none.append(empty);
+                    $('history').append(none);
+                }
+            }, 200);
+        }
+
         /** Open a video from the history without leaving the page. Ctrl or Shift click still opens the link. */
         $('history').addEventListener('click', async (event) => {
+            const remove = event.target.closest('button[data-delete-url]');
+            if (remove) {
+                const row = remove.closest('tr');
+                return askToDelete(remove.dataset.deleteUrl, row.dataset.id, row.querySelector('.name a').textContent);
+            }
             const link = event.target.closest('a[data-status-url]');
             if (!link || event.ctrlKey || event.metaKey || event.shiftKey) return;
             event.preventDefault();
@@ -279,6 +492,24 @@
             timer = setTimeout(() => poll(url), POLL_MS);
         }
 
+        $('job-close').addEventListener('click', closeJob);
+        $('job-cancel').addEventListener('click', askToCancel);
+        $('cancel-confirm').addEventListener('click', () => {
+            $('cancel-dialog').close();
+            cancelJob();
+        });
+        $('job-delete').addEventListener('click', (event) => {
+            askToDelete(event.currentTarget.dataset.url, $('job').dataset.id, $('job-name').textContent);
+        });
+        $('delete-confirm').addEventListener('click', deleteJob);
+        for (const dialog of document.querySelectorAll('.modal')) {
+            dialog.addEventListener('click', (event) => {
+                if (event.target === dialog) dialog.close(); // only the backdrop: the form fills the rest
+            });
+        }
+        $('job-toggle').addEventListener('click', (event) => {
+            foldSteps(event.currentTarget.getAttribute('aria-expanded') !== 'true');
+        });
         video.addEventListener('change', showFile);
         $('job-player').addEventListener('error', (event) => {
             if (!event.target.dataset.url) return; // emptying the player is not a failure
@@ -321,7 +552,7 @@
             showErrors([]);
             clearTimeout(timer);
             start.disabled = true;
-            render({ name: file.name, status: 'queued', progress: 0, message: TEXT.uploading, error: null });
+            render({ name: file.name, status: 'queued', progress: 0, message: TEXT.uploading, error: null, dub: dub.checked });
             try {
                 const response = await fetch(form.action, { method: 'POST', body: new FormData(form), headers: { Accept: 'application/json' } });
                 if (response.status === 201) {

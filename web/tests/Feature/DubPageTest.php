@@ -65,6 +65,9 @@ class DubPageTest extends TestCase
         $this->get('/dub')->assertOk()
             ->assertSee('Khmer Dub')->assertSee('Give your video a Khmer voice')->assertSee($this->user->name)
             ->assertSee('name="video"', false)->assertSee('name="gender"', false)->assertSee('name="dub"', false)
+            ->assertSee('id="job-steps"', false)->assertSee('Transcribing speech')
+            ->assertSee('id="job-cancel"', false)->assertSee('id="cancel-dialog"', false)->assertSee('Stop making this video?')
+            ->assertSee('id="job-toggle"', false)->assertSee('aria-expanded="false"', false)->assertSee('Show all steps')
             ->assertSee('name="original_volume"', false)->assertSee('Original sound')
             ->assertSee('old talk.mp4')
             ->assertSee(route('dub.download', [$job, 'srt']));
@@ -247,13 +250,14 @@ class DubPageTest extends TestCase
 
     public function test_status_returns_the_progress_as_json(): void
     {
-        $job = $this->makeJob(['status' => 'processing', 'progress' => 45, 'message' => 'Translating to Khmer']);
+        $job = $this->makeJob(['status' => 'processing', 'progress' => 45, 'message' => 'Translating to Khmer', 'step_done' => 12, 'step_total' => 29]);
 
         $this->getJson(route('dub.status', $job))->assertOk()->assertExactJson([
             'id' => $job->id, 'name' => 'talk.mp4', 'status' => 'processing', 'progress' => 45,
-            'message' => 'Translating to Khmer', 'error' => null, 'language' => null, 'language_name' => null,
+            'message' => 'Translating to Khmer', 'step_done' => 12, 'step_total' => 29,
+            'error' => null, 'language' => null, 'language_name' => null,
             'dub' => true, 'status_url' => route('dub.status', $job), 'review_url' => null, 'srt_url' => null, 'video_url' => null,
-            'edit_url' => null, 'preview_url' => null, 'subtitles_url' => null,
+            'edit_url' => null, 'preview_url' => null, 'subtitles_url' => null, 'cancel_url' => route('dub.cancel', $job), 'cancel_keeps_edits' => false, 'delete_url' => null,
         ]);
     }
 
@@ -274,7 +278,8 @@ class DubPageTest extends TestCase
         $job = $this->makeJob(['status' => 'done', 'worker_job_id' => 'w1', 'video_path' => 'results/1/dubbed.mp4']);
 
         $this->getJson(route('dub.status', $job))->assertOk()->assertJson(['edit_url' => route('dub.review', $job)]);
-        $this->get(route('dub.index', ['job' => $job->id]))->assertOk()->assertSee('Edit and regenerate');
+        $this->get(route('dub.index', ['job' => $job->id]))->assertOk()->assertSee('Edit and regenerate')
+            ->assertSee('id="job-close"', false)->assertSee('aria-label="Close the video"', false);
     }
 
     public function test_a_video_being_made_again_is_not_offered_for_playing_but_stays_for_download(): void

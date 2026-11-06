@@ -125,8 +125,10 @@ def test_edge_unreachable_says_to_switch_to_mms(no_sleep: None, tmp_path: Path, 
 
 def test_synth_all_skips_segments_without_khmer(fake_edge: list, tmp_path: Path) -> None:
     segments = [{"id": 0, "km": "សួស្តី"}, {"id": 1, "km": " "}, {"id": 2}]
-    synth_all(segments, tmp_path / "clips", "female")
+    steps: list[tuple[int, int]] = []
+    synth_all(segments, tmp_path / "clips", "female", lambda done, total: steps.append((done, total)))
 
+    assert steps == [(1, 1)], "only lines with Khmer are counted"
     assert segments[0]["clip"] == str(tmp_path / "clips" / "0.wav")
     assert Path(segments[0]["clip"]).exists()
     assert "clip" not in segments[1] and "clip" not in segments[2]

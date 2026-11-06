@@ -94,14 +94,18 @@ def test_health_needs_no_token() -> None:
 
 @pytest.mark.parametrize(
     "path",
-    ["/jobs", "/jobs/0123", "/jobs/0123/segments", "/jobs/0123/download/srt", "/jobs/0123/download/video", "/cleanup", "/docs"],
+    ["/jobs", "/jobs/0123", "/jobs/0123/segments", "/jobs/0123/cancel", "/jobs/0123/download/srt", "/jobs/0123/download/video", "/cleanup", "/docs"],
 )
 @pytest.mark.parametrize("headers", [{}, {"x-token": "wrong"}, {"x-token": ""}])
 def test_wrong_or_missing_token_is_401(client: TestClient, path: str, headers: dict) -> None:
-    method = client.post if path in ("/jobs", "/cleanup") else client.get
+    method = client.post if path in ("/jobs", "/jobs/0123/cancel", "/cleanup") else client.get
     response = method(path, headers=headers)
     assert response.status_code == 401
     assert "x-token" in response.json()["detail"]
+
+
+def test_delete_needs_the_token(client: TestClient) -> None:
+    assert client.delete("/jobs/0123").status_code == 401
 
 
 def test_empty_worker_token_refuses_everything(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -121,7 +125,7 @@ def test_dub_job_end_to_end(client: TestClient, runs: list[dict], work_dir: Path
     assert response.json() == {"job_id": job_id}
     assert re.fullmatch(r"[0-9a-f]{32}", job_id)
 
-    assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en"}
+    assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en", "done": None, "total": None}
     assert runs == [{"video": work_dir / job_id / "input.mp4", "exists": True, "gender": "male", "dub": True,
                      "original_volume": None}]
 
@@ -161,6 +165,29 @@ def test_defaults_are_female_and_dub(client: TestClient, runs: list[dict], tone_
 def test_original_volume_reaches_the_pipeline(client: TestClient, runs: list[dict], tone_video: Path) -> None:
     wait(client, upload(client, tone_video, original_volume="0.35").json()["job_id"])
     assert runs[0]["original_volume"] == 0.35
+
+
+def test_the_status_says_how_far_a_step_is(client: TestClient, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reached, release = threading.Event(), threading.Event()
+
+    def slow(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
+        progress(70, "Making the Khmer voice", 12, 29)
+        reached.set()
+        release.wait(5)
+        srt = Path(job_dir) / "khmer.srt"
+        srt.write_text(SRT, encoding="utf-8")
+        return {"language": "en", "segments": 1, "srt": srt, "video": None}
+
+    monkeypatch.setattr(pipeline, "run", slow)
+    job_id = upload(client, tone_video).json()["job_id"]
+    assert reached.wait(5)
+
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).json() == {
+        "status": "processing", "progress": 70, "message": "Making the Khmer voice", "error": None, "language": None,
+        "done": 12, "total": 29,
+    }
+    release.set()
+    assert wait(client, job_id)["done"] is None, "a finished job has no step going on"
 
 
 def test_unknown_job_is_404(client: TestClient) -> None:
@@ -232,7 +259,7 @@ def test_stage_error_fails_the_job(client: TestClient, tone_video: Path, monkeyp
     job_id = upload(client, tone_video).json()["job_id"]
     assert wait(client, job_id) == {
         "status": "failed", "progress": 15, "message": "Failed", "error": "No speech was found in the video.",
-        "language": None,
+        "language": None, "done": None, "total": None,
     }
     response = client.get(f"/jobs/{job_id}/download/srt", headers=AUTH)
     assert response.status_code == 404
@@ -271,10 +298,10 @@ def test_jobs_run_one_at_a_time(client: TestClient, tone_video: Path, monkeypatc
         time.sleep(0.2)  # give a second thread, if there were one, time to start too
         assert started == [first]
         assert client.get(f"/jobs/{first}", headers=AUTH).json() == {
-            "status": "processing", "progress": 45, "message": "Translating to Khmer", "error": None, "language": None
+            "status": "processing", "progress": 45, "message": "Translating to Khmer", "error": None, "language": None, "done": None, "total": None
         }
         assert client.get(f"/jobs/{second}", headers=AUTH).json() == {
-            "status": "queued", "progress": 0, "message": "Waiting in the queue", "error": None, "language": None
+            "status": "queued", "progress": 0, "message": "Waiting in the queue", "error": None, "language": None, "done": None, "total": None
         }
     finally:
         release.set()
@@ -298,7 +325,7 @@ def test_jobs_survive_a_restart(work_dir: Path, runs: list[dict], tone_video: Pa
         assert client.get(f"/jobs/{done}", headers=AUTH).json()["language"] == "en"
         assert client.get(f"/jobs/{done}/download/srt", headers=AUTH).content.decode("utf-8") == SRT
         assert client.get(f"/jobs/{interrupted}", headers=AUTH).json() == {
-            "status": "failed", "progress": 45, "message": "Failed", "error": worker.RESTARTED, "language": None
+            "status": "failed", "progress": 45, "message": "Failed", "error": worker.RESTARTED, "language": None, "done": None, "total": None
         }
         assert client.get("/jobs/notes", headers=AUTH).status_code == 404
 
@@ -421,7 +448,7 @@ def test_review_job_stops_after_translation_and_shows_its_lines(client: TestClie
     job_id = upload(client, tone_video, review="true").json()["job_id"]
 
     assert wait_for(client, job_id, "review") == {
-        "status": "review", "progress": 50, "message": "Waiting for your review", "error": None, "language": "en"
+        "status": "review", "progress": 50, "message": "Waiting for your review", "error": None, "language": "en", "done": None, "total": None
     }
     assert finished == [], "the voice must wait for the review"
     response = client.get(f"/jobs/{job_id}/segments", headers=AUTH)
@@ -445,7 +472,7 @@ def test_saved_edits_reach_the_results(client: TestClient, finished: list, work_
     response = edit(client, job_id, (1, "  ជម្រាបលា  "))
 
     assert response.status_code == 200
-    assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en"}
+    assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en", "done": None, "total": None}
     assert finished == [{"km": ["សួស្តី", "ជម្រាបលា"], "gender": "male", "dub": False, "duration": 60.0,
                          "original_volume": None, "upload_kept": True}]
     assert client.get(f"/jobs/{job_id}/download/srt", headers=AUTH).content.decode("utf-8") == "សួស្តី\nជម្រាបលា"
@@ -537,7 +564,7 @@ def test_a_finished_job_can_be_edited_and_made_again(client: TestClient, finishe
     assert response.status_code == 200
     assert response.json() == {"status": "review"}
     assert client.get(f"/jobs/{job_id}", headers=AUTH).json() == {
-        "status": "review", "progress": 50, "message": "Waiting for your review", "error": None, "language": "en"
+        "status": "review", "progress": 50, "message": "Waiting for your review", "error": None, "language": "en", "done": None, "total": None
     }
     assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).json()["segments"][0]["km"] == "ក"
 
@@ -621,6 +648,176 @@ def test_saving_while_the_job_is_still_running_is_409(client: TestClient, tone_v
     wait(client, job_id)
 
 
+def cancel(client: TestClient, job_id: str) -> httpx.Response:
+    """POST /jobs/{id}/cancel."""
+    return client.post(f"/jobs/{job_id}/cancel", headers=AUTH)
+
+
+@pytest.fixture
+def held(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict]:
+    """A pipeline.run that reports one step, waits for "release", then reports the next ones."""
+    state = {"started": threading.Event(), "release": threading.Event(), "reached": []}
+
+    def run(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
+        progress(5, "Extracting audio")
+        state["started"].set()
+        state["release"].wait(10)
+        progress(15, "Transcribing speech")
+        state["reached"].append(video_path)
+        srt = Path(job_dir) / "khmer.srt"
+        srt.write_text(SRT, encoding="utf-8")
+        return {"language": "en", "segments": 1, "srt": srt, "video": None}
+
+    monkeypatch.setattr(pipeline, "run", run)
+    yield state
+    state["release"].set()
+
+
+def test_a_running_job_stops_at_its_next_step(client: TestClient, held: dict, work_dir: Path, tone_video: Path) -> None:
+    job_id = upload(client, tone_video).json()["job_id"]
+    assert held["started"].wait(10)
+
+    response = cancel(client, job_id)
+    assert response.status_code == 200
+    assert response.json() == {"status": "processing"}  # it has not reached a step yet
+    held["release"].set()
+
+    status = wait_for(client, job_id, "cancelled")
+    assert status["message"] == "Cancelled"
+    assert (status["error"], status["done"], status["total"]) == (None, None, None)
+    assert held["reached"] == []
+    assert not (work_dir / job_id / "input.mp4").exists()
+    assert client.get(f"/jobs/{job_id}/download/srt", headers=AUTH).status_code == 404
+    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).status_code == 409
+
+
+def test_a_job_in_line_stops_at_once_and_never_runs(client: TestClient, held: dict, tone_video: Path) -> None:
+    first = upload(client, tone_video).json()["job_id"]
+    assert held["started"].wait(10)
+    second = upload(client, tone_video).json()["job_id"]
+
+    assert cancel(client, second).json() == {"status": "cancelled"}
+    assert cancel(client, first).json() == {"status": "processing"}
+    held["release"].set()
+
+    wait_for(client, first, "cancelled")
+    assert held["reached"] == []
+    assert client.get(f"/jobs/{second}", headers=AUTH).json()["status"] == "cancelled"
+
+
+def test_the_next_job_runs_after_a_cancelled_one(client: TestClient, held: dict, tone_video: Path) -> None:
+    first = upload(client, tone_video).json()["job_id"]
+    assert held["started"].wait(10)
+    second = upload(client, tone_video).json()["job_id"]
+    cancel(client, first)
+    held["release"].set()
+
+    wait_for(client, first, "cancelled")
+    assert wait(client, second)["status"] == "done"
+
+
+def test_only_a_queued_or_running_job_can_be_cancelled(client: TestClient, finished: list, tone_video: Path) -> None:
+    assert cancel(client, "0" * 32).status_code == 404
+    job_id = in_review(client, tone_video)
+    assert cancel(client, job_id).status_code == 409
+    assert edit(client, job_id, (0, "ពិនិត្យរួច")).status_code == 200
+    wait(client, job_id)
+    response = cancel(client, job_id)
+    assert response.status_code == 409
+    assert "nothing to cancel" in response.json()["detail"]
+
+
+def test_cancelling_after_the_review_keeps_the_edits(
+    client: TestClient, finished: list, tone_video: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = in_review(client, tone_video)
+    working_finish, started, release = pipeline.finish, threading.Event(), threading.Event()
+
+    def held_finish(job_dir: Path, video_path: Path, gender: str, dub: bool, duration: float, progress: Progress,
+                    original_volume: float | None = None) -> dict:
+        progress(60, "Making the Khmer voice")
+        started.set()
+        release.wait(10)
+        progress(85, "Mixing and merging")
+        pytest.fail("the job went on after it was cancelled")
+
+    monkeypatch.setattr(pipeline, "finish", held_finish)
+    assert edit(client, job_id, (0, "ពិនិត្យរួច")).status_code == 200
+    assert started.wait(10)
+    assert cancel(client, job_id).json() == {"status": "processing"}
+    release.set()
+
+    status = wait_for(client, job_id, "review")
+    assert status["progress"] == worker.REVIEW_PROGRESS
+    assert (status["message"], status["error"]) == (worker.REVIEW_MESSAGE, None)
+    lines = client.get(f"/jobs/{job_id}/segments", headers=AUTH).json()["segments"]
+    assert lines[0]["km"] == "ពិនិត្យរួច"
+
+    monkeypatch.setattr(pipeline, "finish", working_finish)
+    assert edit(client, job_id, (0, "ម្ដងទៀត")).status_code == 200
+    assert wait(client, job_id)["status"] == "done"
+
+
+def test_a_reviewed_job_in_line_goes_back_to_review_and_cannot_run_twice(
+    client: TestClient, finished: list, held: dict, tone_video: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = in_review(client, tone_video)
+    blocker = upload(client, tone_video).json()["job_id"]
+    assert held["started"].wait(10)
+    assert edit(client, job_id, (0, "ពិនិត្យរួច")).status_code == 200
+
+    assert cancel(client, job_id).json() == {"status": "review"}
+    assert edit(client, job_id, (0, "ម្ដងទៀត")).status_code == 200
+    held["release"].set()
+
+    wait(client, blocker)
+    assert wait(client, job_id)["status"] == "done"
+    assert len(finished) == 1
+
+
+def test_a_stopped_job_can_be_deleted(client: TestClient, work_dir: Path, tone_video: Path) -> None:
+    job_id = upload(client, tone_video).json()["job_id"]
+    wait(client, job_id)
+    assert (work_dir / job_id / "dubbed.mp4").is_file()
+
+    response = client.delete(f"/jobs/{job_id}", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "deleted"}
+    assert not (work_dir / job_id).exists()
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).status_code == 404
+    assert client.delete(f"/jobs/{job_id}", headers=AUTH).status_code == 404
+
+
+def test_a_job_in_review_can_be_deleted(client: TestClient, finished: list, work_dir: Path, tone_video: Path) -> None:
+    job_id = in_review(client, tone_video)
+
+    assert client.delete(f"/jobs/{job_id}", headers=AUTH).status_code == 200
+    assert not (work_dir / job_id).exists()
+
+
+def test_a_deleted_job_stays_gone_after_a_restart(work_dir: Path, runs: list[dict], tone_video: Path) -> None:
+    with TestClient(worker.app) as first:
+        job_id = upload(first, tone_video).json()["job_id"]
+        wait(first, job_id)
+        first.delete(f"/jobs/{job_id}", headers=AUTH)
+    with TestClient(worker.app) as second:
+        assert second.get(f"/jobs/{job_id}", headers=AUTH).status_code == 404
+
+
+def test_a_running_job_cannot_be_deleted(client: TestClient, held: dict, work_dir: Path, tone_video: Path) -> None:
+    job_id = upload(client, tone_video).json()["job_id"]
+    assert held["started"].wait(10)
+
+    response = client.delete(f"/jobs/{job_id}", headers=AUTH)
+
+    assert response.status_code == 409
+    assert "Cancel it first" in response.json()["detail"]
+    assert (work_dir / job_id).is_dir()
+    held["release"].set()
+    wait(client, job_id)
+
+
 def test_failed_voice_keeps_the_edits_and_can_be_retried(
     client: TestClient, finished: list, tone_video: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -644,7 +841,7 @@ def test_failed_voice_keeps_the_edits_and_can_be_retried(
 
     monkeypatch.setattr(pipeline, "finish", working_finish)
     assert edit(client, job_id).status_code == 200
-    assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en"}
+    assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en", "done": None, "total": None}
     assert finished[0]["km"][0] == "ពិនិត្យរួច"
 
 
@@ -677,7 +874,7 @@ def test_a_restart_during_the_voice_keeps_the_edits(work_dir: Path, runs: list[d
     with TestClient(worker.app) as client:
         assert client.get(f"/jobs/{job_id}", headers=AUTH).json() == {
             "status": "review", "progress": 50, "message": "Waiting for your review",
-            "error": worker.RESTARTED_REVIEW, "language": "en",
+            "error": worker.RESTARTED_REVIEW, "language": "en", "done": None, "total": None,
         }
         assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).json()["segments"][0]["km"] == "ពិនិត្យរួច"
         assert edit(client, job_id).status_code == 200

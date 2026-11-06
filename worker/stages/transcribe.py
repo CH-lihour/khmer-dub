@@ -4,6 +4,7 @@ import functools
 import logging
 import re
 import wave
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -25,13 +26,14 @@ SENTENCE_END = re.compile(r"[.!?…。！？។៕][\"'”’)\]»]*$")
 CLAUSE_MARKS = ",;:，、；：-–—"  # a line ending in one of these goes on in the next line
 
 
-def transcribe(wav_path: str | Path) -> tuple[list[dict], str]:
+def transcribe(wav_path: str | Path, on_step: Callable[[int, int], None] | None = None) -> tuple[list[dict], str]:
     """Transcribe a 16 kHz WAV and return its timed segments and the detected language code (e.g. "en").
 
     Each segment is {"id", "start", "end", "text"}, with times in seconds from the start of the
     video. Silence is skipped with the VAD filter and empty segments are dropped. Whisper's
     boundaries are then moved onto the detected speech, because it often starts a line early, and
     the parts of a sentence that was split over two lines are joined, so it is translated whole.
+    `on_step(done, total)` reports how many seconds of the video have been heard so far.
     Raises StageError if no speech is found or the model cannot be loaded.
     """
     audio = _read_wav(Path(wav_path))
@@ -40,10 +42,13 @@ def transcribe(wav_path: str | Path) -> tuple[list[dict], str]:
     pieces, info = model.transcribe(audio, vad_filter=True, word_timestamps=True)
 
     segments: list[dict] = []
+    total = int(info.duration)
     for piece in pieces:  # a generator: the decoding happens here
         for start, end, text in _split_at_pauses(piece):
             if text.strip():
                 segments.append({"id": len(segments), "start": start, "end": end, "text": text.strip()})
+        if on_step:
+            on_step(min(int(piece.end), total), total)
 
     if not segments:
         raise StageError("No speech was found in the video.")

@@ -39,6 +39,9 @@ class ProcessVideoJob implements ShouldQueue
 
     public bool $failOnTimeout = true;
 
+    /** A video deleted while it waited in the queue has nothing left to do. */
+    public bool $deleteWhenMissingModels = true;
+
     /**
      * @param  VideoJob  $videoJob  the row to process ($job is taken by the queue)
      */
@@ -49,29 +52,43 @@ class ProcessVideoJob implements ShouldQueue
      *
      * A review can take days, so the job ends there instead of holding the queue. Saving the review
      * dispatches it again, and it goes on following the same worker job. Any exception ends in
-     * failed(). New results replace old ones only once both have arrived.
+     * failed(). New results replace old ones only once both have arrived. A job cancelled while it
+     * waited in the queue is not started.
      */
     public function handle(): void
     {
         $job = $this->videoJob;
+        if (VideoJob::whereKey($job->id)->where('status', VideoJob::QUEUED)->update(['status' => VideoJob::PROCESSING]) === 0) {
+            return;
+        }
+
         if ($job->worker_job_id === null) {
             $job->update(['status' => VideoJob::PROCESSING, 'progress' => 0, 'message' => 'Sending the video to the worker', 'error' => null]);
             $job->update(['worker_job_id' => $this->submit($job)]);
+            if ($job->refresh()->cancel_requested) { // asked for while the video was on its way
+                $this->worker()->post("/jobs/{$job->worker_job_id}/cancel");
+            }
         }
 
         $workerId = $job->worker_job_id;
         $status = $this->follow($job, $workerId);
+        $job->refresh(); // the site may have asked to cancel since this copy was read
         $language = $status['language'] ?? null;
+        if ($status['status'] === VideoJob::CANCELLED) {
+            $job->markStopped(VideoJob::CANCELLED);
+
+            return;
+        }
         if ($status['status'] === 'review') {
             $job->update([
                 'status' => VideoJob::REVIEW, 'progress' => (int) ($status['progress'] ?? 0), 'message' => $status['message'] ?? null,
-                'language' => $language, 'error' => $status['error'] ?? null,
+                'language' => $language, 'error' => $status['error'] ?? null, 'step_done' => null, 'step_total' => null, 'cancel_requested' => false,
             ]);
 
             return;
         }
 
-        $job->update(['progress' => 99, 'message' => 'Downloading the results']);
+        $job->update(['progress' => 99, 'message' => 'Downloading the results', 'step_done' => null, 'step_total' => null]);
         $folder = $job->resultsFolder();
         $files = ['srt' => "{$folder}/khmer.srt"] + ($job->dub ? ['video' => "{$folder}/dubbed.mp4"] : []);
         foreach ($files as $kind => $path) {
@@ -83,7 +100,7 @@ class ProcessVideoJob implements ShouldQueue
 
         $job->update([
             'status' => VideoJob::DONE, 'progress' => 100, 'message' => 'Done', 'language' => $language, 'error' => null,
-            'srt_path' => $files['srt'], 'video_path' => $files['video'] ?? null,
+            'srt_path' => $files['srt'], 'video_path' => $files['video'] ?? null, 'cancel_requested' => false,
         ]);
     }
 
@@ -96,7 +113,7 @@ class ProcessVideoJob implements ShouldQueue
         $outcome = $this->videoJob->video_path !== null
             ? ['status' => VideoJob::DONE, 'progress' => 100, 'message' => 'Done']
             : ['status' => VideoJob::FAILED, 'message' => 'Failed'];
-        $this->videoJob->update([...$outcome, 'error' => self::reason($exception)]);
+        $this->videoJob->update([...$outcome, 'error' => self::reason($exception), 'step_done' => null, 'step_total' => null]);
     }
 
     /**
@@ -148,8 +165,8 @@ class ProcessVideoJob implements ShouldQueue
     /**
      * Poll GET /jobs/{id} every POLL_SECONDS and copy the progress into the row until the job stops.
      *
-     * Returns the worker's status once it is done or waits for review. Throws DubbingFailed with
-     * the worker's reason if it failed.
+     * Returns the worker's status once it is done, cancelled or waits for review. Throws DubbingFailed
+     * with the worker's reason if it failed.
      *
      * @return array<string, mixed>
      */
@@ -161,7 +178,7 @@ class ProcessVideoJob implements ShouldQueue
                 ->get("/jobs/{$workerId}");
             $status = $this->check($response, 'report the progress')->json();
 
-            if (in_array($status['status'] ?? null, ['done', 'review'], true)) {
+            if (in_array($status['status'] ?? null, ['done', 'review', 'cancelled'], true)) {
                 return $status;
             }
             if (($status['status'] ?? null) === 'failed') {
@@ -175,6 +192,8 @@ class ProcessVideoJob implements ShouldQueue
                 'status' => $status['status'] === 'queued' ? VideoJob::QUEUED : VideoJob::PROCESSING,
                 'progress' => min(99, max(0, (int) ($status['progress'] ?? 0))), // 100 only once the files are here
                 'message' => $status['message'] ?? null,
+                'step_done' => $status['done'] ?? null,
+                'step_total' => $status['total'] ?? null,
             ]);
             Sleep::sleep(self::POLL_SECONDS);
         }

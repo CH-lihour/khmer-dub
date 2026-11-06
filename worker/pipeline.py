@@ -17,7 +17,7 @@ from stages.tts import synth_all
 
 log = logging.getLogger(__name__)
 
-Progress = Callable[[int, str], None]
+Progress = Callable[..., None]  # progress(percent, message), or with (done, total) inside a stage
 VOICE_FIELDS = ("clip", "speed", "cut_ms", "dub_end")  # what the voice and mix stages add to a segment
 
 
@@ -26,7 +26,8 @@ def run(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, pro
     """Process one video inside `job_dir` and return {"language", "segments", "srt", "video"}.
 
     Reports the API contract's milestones through `progress(percent, message)`: 5 extract audio,
-    15 transcribe, 45 translate, 60 voice, 85 mix and merge, 100 done. With dub=False it stops
+    15 transcribe, 45 translate, 60 voice, 85 mix and merge, 100 done. Between them, the long stages
+    add how far they are: `progress(percent, message, done, total)`. With dub=False it stops
     after the SRT and "video" is None. `gender` ("female" or "male") picks the Khmer voice, and
     `original_volume` (0 to 1) how loud the original sound plays under it; None uses
     ORIGINAL_VOLUME. Stage failures raise StageError with a message the user can act on.
@@ -49,10 +50,10 @@ def prepare(job_dir: str | Path, video_path: str | Path, progress: Progress) -> 
     duration = extract_audio(video_path, wav)
 
     progress(15, "Transcribing speech")
-    segments, language = transcribe(wav)
+    segments, language = transcribe(wav, _step(progress, 15, 44, "Transcribing speech"))
 
     progress(45, "Translating to Khmer")
-    translate(segments, language)
+    translate(segments, language, _step(progress, 45, 49, "Translating to Khmer"))
     save_segments(job_dir, segments)
     return {"language": language, "duration": duration}
 
@@ -75,7 +76,7 @@ def finish(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, 
     video = None
     if dub:
         progress(60, "Making the Khmer voice")
-        synth_all(segments, job_dir / "clips", gender)
+        synth_all(segments, job_dir / "clips", gender, _step(progress, 60, 84, "Making the Khmer voice"))
         progress(85, "Mixing and merging")
         dub_wav = build_track(segments, round(duration * 1000), job_dir)
         video = merge(video_path, dub_wav, job_dir / "dubbed.mp4", original_volume)
@@ -85,6 +86,14 @@ def finish(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, 
     progress(100, "Done")
     log.info("Job %s done: %d segments", job_dir.name, len(segments))
     return {"segments": len(segments), "srt": srt, "video": video}
+
+
+def _step(progress: Progress, first: int, last: int, message: str) -> Callable[[int, int], None]:
+    """A callback for a long stage: `done` of `total` moves the progress from `first` up to `last`."""
+    def step(done: int, total: int) -> None:
+        progress(first + (last - first) * done // max(total, 1), message, done, total)
+
+    return step
 
 
 def load_segments(job_dir: str | Path) -> list[dict]:
