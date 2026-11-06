@@ -117,6 +117,90 @@ class DubPageTest extends TestCase
         Queue::assertPushed(ProcessVideoJob::class, fn (ProcessVideoJob $pushed) => $pushed->videoJob->is($job));
     }
 
+    public function test_a_new_user_gets_the_default_choices(): void
+    {
+        $this->get('/dub')->assertOk()
+            ->assertSee('value="female" checked', false)->assertSee('name="dub" value="1" checked', false)
+            ->assertSee('name="original_volume" min="0" max="1" step="0.05" value="0"', false)
+            ->assertDontSee('name="review" value="1" checked', false);
+    }
+
+    public function test_the_form_remembers_the_choices_of_the_last_upload(): void
+    {
+        $this->post('/dub', [
+            'video' => UploadedFile::fake()->create('a.mp4', 10, 'video/mp4'),
+            'gender' => 'male', 'dub' => '1', 'review' => '1', 'original_volume' => '0.35',
+        ], self::JSON)->assertCreated();
+
+        $this->assertSame(
+            ['gender' => 'male', 'dub' => true, 'review' => true, 'original_volume' => 0.35],
+            $this->user->fresh()->dubOptions(),
+        );
+        $this->get('/dub')->assertOk()
+            ->assertSee('value="male" checked', false)->assertDontSee('value="female" checked', false)
+            ->assertSee('name="dub" value="1" checked', false)->assertSee('name="review" value="1" checked', false)
+            ->assertSee('step="0.05" value="0.35"', false)->assertSee('35%');
+    }
+
+    public function test_a_changed_choice_survives_a_refresh_without_an_upload(): void
+    {
+        $this->post(route('dub.options'), ['gender' => 'male', 'dub' => '1', 'review' => '1', 'original_volume' => '0.6'], self::JSON)
+            ->assertNoContent();
+
+        $this->assertSame(0, VideoJob::count());
+        $this->get('/dub')->assertOk()
+            ->assertSee('value="male" checked', false)->assertSee('name="review" value="1" checked', false)
+            ->assertSee('step="0.05" value="0.6"', false)->assertSee('60%');
+    }
+
+    public function test_turning_dubbing_off_keeps_the_chosen_original_sound_level(): void
+    {
+        $this->user->forceFill(['dub_options' => [...User::DUB_DEFAULTS, 'original_volume' => 0.4]])->save();
+
+        $this->post(route('dub.options'), ['gender' => 'female'], self::JSON)->assertNoContent(); // the form sends no level then
+
+        $options = $this->user->fresh()->dubOptions();
+        $this->assertSame([false, false, 0.4], [$options['dub'], $options['review'], $options['original_volume']]);
+    }
+
+    public function test_bad_choices_are_not_saved(): void
+    {
+        $this->post(route('dub.options'), ['gender' => 'robot'], self::JSON)->assertUnprocessable();
+        $this->post(route('dub.options'), ['original_volume' => '1.5'], self::JSON)->assertUnprocessable();
+
+        $this->assertNull($this->user->fresh()->dub_options);
+    }
+
+    public function test_guests_cannot_save_choices(): void
+    {
+        auth()->logout();
+
+        $this->post(route('dub.options'), ['gender' => 'male'])->assertRedirect(route('login'));
+    }
+
+    public function test_a_subtitles_only_upload_keeps_the_chosen_original_sound_level(): void
+    {
+        $this->user->forceFill(['dub_options' => [...User::DUB_DEFAULTS, 'original_volume' => 0.4]])->save();
+
+        $this->post('/dub', ['video' => UploadedFile::fake()->create('a.mp4', 10, 'video/mp4')], self::JSON)->assertCreated();
+
+        $options = $this->user->fresh()->dubOptions();
+        $this->assertSame([false, 0.4], [$options['dub'], $options['original_volume']]);
+        $this->assertSame(0.0, VideoJob::sole()->original_volume);
+        $this->get('/dub')->assertOk()->assertDontSee('name="dub" value="1" checked', false)
+            ->assertSee('class="level off"', false)->assertSee('--fill: 40%', false);
+    }
+
+    public function test_choices_belong_to_each_user_and_a_refused_upload_changes_nothing(): void
+    {
+        $this->post('/dub', ['video' => UploadedFile::fake()->create('a.mp4', 10, 'video/mp4'), 'gender' => 'male'], self::JSON)->assertCreated();
+        $this->post('/dub', ['gender' => 'female'], self::JSON)->assertUnprocessable();
+        $this->assertSame('male', $this->user->fresh()->dubOptions()['gender']);
+
+        $this->actingAs(User::factory()->create());
+        $this->get('/dub')->assertOk()->assertSee('value="female" checked', false);
+    }
+
     public function test_unchecked_dub_means_subtitles_only_and_voice_defaults_to_female(): void
     {
         $this->post('/dub', ['video' => UploadedFile::fake()->create('a.webm', 10, 'video/webm')], self::JSON)->assertCreated();
@@ -169,7 +253,7 @@ class DubPageTest extends TestCase
             'id' => $job->id, 'name' => 'talk.mp4', 'status' => 'processing', 'progress' => 45,
             'message' => 'Translating to Khmer', 'error' => null, 'language' => null, 'language_name' => null,
             'dub' => true, 'status_url' => route('dub.status', $job), 'review_url' => null, 'srt_url' => null, 'video_url' => null,
-            'preview_url' => null, 'subtitles_url' => null,
+            'edit_url' => null, 'preview_url' => null, 'subtitles_url' => null,
         ]);
     }
 
@@ -180,8 +264,27 @@ class DubPageTest extends TestCase
         $this->getJson(route('dub.status', $job))->assertOk()->assertJson([
             'status' => 'done', 'language' => 'en', 'language_name' => 'English',
             'srt_url' => route('dub.download', [$job, 'srt']), 'video_url' => route('dub.download', [$job, 'video']),
-            'preview_url' => route('dub.preview', [$job, 'video']), 'subtitles_url' => route('dub.preview', [$job, 'vtt']),
+            'preview_url' => route('dub.preview', [$job, 'video', 'v' => $job->updated_at->timestamp]),
+            'subtitles_url' => route('dub.preview', [$job, 'vtt', 'v' => $job->updated_at->timestamp]),
         ]);
+    }
+
+    public function test_a_finished_dubbed_video_offers_editing(): void
+    {
+        $job = $this->makeJob(['status' => 'done', 'worker_job_id' => 'w1', 'video_path' => 'results/1/dubbed.mp4']);
+
+        $this->getJson(route('dub.status', $job))->assertOk()->assertJson(['edit_url' => route('dub.review', $job)]);
+        $this->get(route('dub.index', ['job' => $job->id]))->assertOk()->assertSee('Edit and regenerate');
+    }
+
+    public function test_a_video_being_made_again_is_not_offered_for_playing_but_stays_for_download(): void
+    {
+        $job = $this->makeJob(['status' => 'processing', 'progress' => 60, 'worker_job_id' => 'w1', 'video_path' => 'results/1/dubbed.mp4']);
+
+        $this->getJson(route('dub.status', $job))->assertOk()->assertJson([
+            'preview_url' => null, 'edit_url' => null, 'video_url' => route('dub.download', [$job, 'video']),
+        ]);
+        $this->get('/dub')->assertOk()->assertDontSee('class="play" href="'.route('dub.index', ['job' => $job->id]).'"', false);
     }
 
     public function test_a_subtitles_only_job_has_nothing_to_preview(): void
@@ -189,6 +292,25 @@ class DubPageTest extends TestCase
         $job = $this->makeJob(['status' => 'done', 'dub' => false, 'srt_path' => 'results/1/khmer.srt']);
 
         $this->getJson(route('dub.status', $job))->assertOk()->assertJson(['preview_url' => null, 'subtitles_url' => null]);
+    }
+
+    public function test_old_dubbed_videos_can_be_played_from_the_history(): void
+    {
+        $dubbed = $this->makeJob(['status' => 'done', 'video_path' => 'results/1/dubbed.mp4']);
+        $subtitles = $this->makeJob(['status' => 'done', 'dub' => false, 'srt_path' => 'results/2/khmer.srt']);
+
+        $this->get('/dub')->assertOk()
+            ->assertSee('Play')
+            ->assertSee('class="play" href="'.route('dub.index', ['job' => $dubbed->id]).'"', false)
+            ->assertDontSee('class="play" href="'.route('dub.index', ['job' => $subtitles->id]).'"', false);
+    }
+
+    public function test_every_video_in_the_history_opens_without_leaving_the_page(): void
+    {
+        $job = $this->makeJob(['status' => 'failed']);
+
+        $this->get('/dub')->assertOk()
+            ->assertSee('<a href="'.route('dub.index', ['job' => $job->id]).'" data-status-url="'.route('dub.status', $job).'">', false);
     }
 
     public function test_the_player_can_seek_in_the_dubbed_video(): void

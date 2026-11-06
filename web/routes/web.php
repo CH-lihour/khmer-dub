@@ -21,6 +21,7 @@ Route::middleware('auth')->group(function () {
     Route::controller(VideoJobController::class)->group(function () {
         Route::get('/dub', 'index')->name('dub.index');
         Route::post('/dub', 'store')->name('dub.store');
+        Route::post('/dub/options', 'saveOptions')->name('dub.options');
         Route::get('/dub/{job}/status', 'status')->name('dub.status');
         Route::get('/dub/{job}/review', 'review')->name('dub.review');
         Route::post('/dub/{job}/review', 'saveReview')->name('dub.review.save');

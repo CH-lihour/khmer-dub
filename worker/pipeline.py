@@ -18,6 +18,7 @@ from stages.tts import synth_all
 log = logging.getLogger(__name__)
 
 Progress = Callable[[int, str], None]
+VOICE_FIELDS = ("clip", "speed", "cut_ms", "dub_end")  # what the voice and mix stages add to a segment
 
 
 def run(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, progress: Progress,
@@ -61,10 +62,13 @@ def finish(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, 
     """Turn the saved segments.json into the results and return {"segments", "srt", "video"}.
 
     An empty Khmer line gets no subtitle and no voice. With dub=False it stops after the SRT and
-    "video" is None.
+    "video" is None. The results of an earlier run are replaced.
     """
     job_dir = Path(job_dir)
     segments = load_segments(job_dir)
+    for seg in segments:  # from an earlier run: a line emptied since then must not keep its old voice
+        for key in VOICE_FIELDS:
+            seg.pop(key, None)
     srt = job_dir / "khmer.srt"
     write_srt(segments, srt)
 

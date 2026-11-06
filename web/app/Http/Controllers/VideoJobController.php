@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Jobs\ProcessVideoJob;
+use App\Models\User;
 use App\Models\VideoJob;
 use App\Support\Worker;
 use Illuminate\Http\Client\ConnectionException;
@@ -26,6 +27,17 @@ class VideoJobController extends Controller
     /** Number of past jobs listed under the form. */
     private const HISTORY = 20;
 
+    /** Seconds allowed for sending a video to the worker again. */
+    private const TRANSFER_SECONDS = 600;
+
+    /** The choices on the upload form. */
+    private const OPTION_RULES = [
+        'gender' => ['sometimes', 'in:male,female'],
+        'dub' => ['sometimes', 'boolean'],
+        'review' => ['sometimes', 'boolean'],
+        'original_volume' => ['sometimes', 'numeric', 'between:0,1'],
+    ];
+
     /**
      * Show the upload form, the job being followed and the user's recent jobs.
      *
@@ -41,6 +53,7 @@ class VideoJobController extends Controller
         return view('dub.index', [
             'jobs' => $jobs,
             'current' => $current ? $this->statusData($current) : null,
+            'options' => $request->user()->dubOptions(),
         ]);
     }
 
@@ -53,10 +66,7 @@ class VideoJobController extends Controller
     {
         $data = $request->validate([
             'video' => ['required', 'file', 'mimes:mp4,mov,mkv,webm', 'max:512000'],
-            'gender' => ['sometimes', 'in:male,female'],
-            'dub' => ['sometimes', 'boolean'],
-            'review' => ['sometimes', 'boolean'],
-            'original_volume' => ['sometimes', 'numeric', 'between:0,1'],
+            ...self::OPTION_RULES,
         ], [
             'video.required' => __('Choose a video file.'),
             'video.uploaded' => __('The video did not upload completely. It may be larger than 500 MB.'),
@@ -82,12 +92,24 @@ class VideoJobController extends Controller
             'message' => 'Waiting in the queue',
         ]);
         ProcessVideoJob::dispatch($job);
+        $this->rememberOptions($request);
 
         if ($request->expectsJson()) {
             return response()->json(['id' => $job->id, 'status_url' => route('dub.status', $job)], 201);
         }
 
         return redirect()->route('dub.index', ['job' => $job->id]);
+    }
+
+    /**
+     * Keep the form's choices as soon as one changes, so they survive a refresh. The page sends this.
+     */
+    public function saveOptions(Request $request): HttpResponse
+    {
+        $request->validate(self::OPTION_RULES);
+        $this->rememberOptions($request);
+
+        return response()->noContent();
     }
 
     /**
@@ -127,12 +149,12 @@ class VideoJobController extends Controller
     }
 
     /**
-     * Show the Khmer lines of a job waiting for review, next to the original text.
+     * Show the Khmer lines of a job waiting for review or a finished dubbed video, next to the original text.
      */
     public function review(Request $request, VideoJob $job): View|RedirectResponse
     {
         $this->authorizeOwner($request, $job);
-        if ($job->status !== VideoJob::REVIEW) {
+        if (! $job->canEdit()) {
             return redirect()->route('dub.index', ['job' => $job->id]);
         }
 
@@ -150,22 +172,35 @@ class VideoJobController extends Controller
 
     /**
      * Send the reviewed Khmer to the worker and queue the job again to follow the rest of it.
+     *
+     * The worker no longer has the video of a finished job, so it gets it again first. The old
+     * results stay in place until the new ones are here.
      */
     public function saveReview(Request $request, VideoJob $job): RedirectResponse
     {
         $this->authorizeOwner($request, $job);
-        if ($job->status !== VideoJob::REVIEW) {
+        if (! $job->canEdit()) {
             return redirect()->route('dub.index', ['job' => $job->id]);
         }
 
         $data = $request->validate([
             'km' => ['required', 'array'],
             'km.*' => ['nullable', 'string', 'max:2000'],
-        ], ['km.*.max' => __('A line can have at most 2000 characters.')]);
+            'gender' => self::OPTION_RULES['gender'],
+            'original_volume' => self::OPTION_RULES['original_volume'],
+        ], [
+            'km.*.max' => __('A line can have at most 2000 characters.'),
+            'gender.in' => __('Choose the female or the male voice.'),
+            'original_volume.*' => __('Choose an original sound level from 0 to 100%.'),
+        ]);
         $lines = collect($data['km'])->map(fn (?string $text, int|string $id) => ['id' => (int) $id, 'km' => (string) $text]);
+        $choices = ['gender' => $data['gender'] ?? $job->gender, 'original_volume' => (float) ($data['original_volume'] ?? $job->original_volume)];
 
         try {
-            $response = Worker::client()->put("/jobs/{$job->worker_job_id}/segments", ['segments' => $lines->values()->all()]);
+            $response = $job->status === VideoJob::DONE ? $this->reopen($job) : null;
+            if ($response === null || $response->successful()) {
+                $response = Worker::client()->put("/jobs/{$job->worker_job_id}/segments", ['segments' => $lines->values()->all(), ...$choices]);
+            }
         } catch (ConnectionException) {
             return back()->withInput()->withErrors(['review' => Worker::UNREACHABLE]);
         }
@@ -173,10 +208,47 @@ class VideoJobController extends Controller
             return back()->withInput()->withErrors(['review' => $this->workerError($response)]);
         }
 
-        $job->update(['status' => VideoJob::QUEUED, 'message' => 'Waiting in the queue', 'error' => null]);
+        $job->update(['status' => VideoJob::QUEUED, 'progress' => 50, 'message' => 'Waiting in the queue', 'error' => null, ...$choices]);
         ProcessVideoJob::dispatch($job);
 
         return redirect()->route('dub.index', ['job' => $job->id]);
+    }
+
+    /**
+     * Send the original video to the worker again, which puts its finished job back in review.
+     */
+    private function reopen(VideoJob $job): Response
+    {
+        $disk = Storage::disk('local');
+        if (! $disk->exists($job->path)) {
+            throw ValidationException::withMessages(['review' => __('The uploaded video is missing on the server. Please upload it again.')]);
+        }
+
+        $stream = $disk->readStream($job->path);
+        try {
+            return Worker::client()->timeout(self::TRANSFER_SECONDS)
+                ->attach('file', $stream, basename($job->path))
+                ->post("/jobs/{$job->worker_job_id}/reopen");
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+    }
+
+    /**
+     * Keep the form's choices for this user. The form sends no original sound level while dubbing
+     * is off, so the level they chose before stays.
+     */
+    private function rememberOptions(Request $request): void
+    {
+        $user = $request->user();
+        $user->forceFill(['dub_options' => [
+            'gender' => $request->input('gender', User::DUB_DEFAULTS['gender']),
+            'dub' => $request->boolean('dub'),
+            'review' => $request->boolean('review'),
+            'original_volume' => (float) $request->input('original_volume', $user->dubOptions()['original_volume']),
+        ]])->save();
     }
 
     /**
@@ -220,6 +292,8 @@ class VideoJobController extends Controller
      */
     private function statusData(VideoJob $job): array
     {
+        $version = $job->updated_at?->timestamp; // a remade video gets a new address, so no browser shows the old one
+
         return [
             'id' => $job->id,
             'name' => $job->original_name,
@@ -232,10 +306,11 @@ class VideoJobController extends Controller
             'dub' => $job->dub,
             'status_url' => route('dub.status', $job),
             'review_url' => $job->status === VideoJob::REVIEW ? route('dub.review', $job) : null,
+            'edit_url' => $job->status === VideoJob::DONE && $job->canEdit() ? route('dub.review', $job) : null,
             'srt_url' => $job->srt_path ? route('dub.download', [$job, 'srt']) : null,
             'video_url' => $job->video_path ? route('dub.download', [$job, 'video']) : null,
-            'preview_url' => $job->video_path ? route('dub.preview', [$job, 'video']) : null,
-            'subtitles_url' => $job->video_path && $job->srt_path ? route('dub.preview', [$job, 'vtt']) : null,
+            'preview_url' => $job->hasPlayableVideo() ? route('dub.preview', [$job, 'video', 'v' => $version]) : null,
+            'subtitles_url' => $job->hasPlayableVideo() && $job->srt_path ? route('dub.preview', [$job, 'vtt', 'v' => $version]) : null,
         ];
     }
 }

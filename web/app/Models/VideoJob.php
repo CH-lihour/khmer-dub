@@ -110,6 +110,23 @@ class VideoJob extends Model
     }
 
     /**
+     * Whether the Khmer can be edited now: a job waiting for review, or a finished dubbed video.
+     */
+    public function canEdit(): bool
+    {
+        return $this->status === self::REVIEW
+            || ($this->status === self::DONE && $this->video_path !== null && $this->worker_job_id !== null);
+    }
+
+    /**
+     * Whether there is a dubbed video to play. While one is being made again, the old one is not offered.
+     */
+    public function hasPlayableVideo(): bool
+    {
+        return $this->video_path !== null && in_array($this->status, [self::DONE, self::REVIEW], true);
+    }
+
+    /**
      * The detected language by name, in the page's language, or null before it is known.
      */
     public function languageName(): ?string

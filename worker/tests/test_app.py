@@ -509,10 +509,100 @@ def test_review_routes_need_a_job_in_review(client: TestClient, finished: list, 
     wait(client, job_id)
 
     assert edit(client, job_id, (0, "ខ")).status_code == 409, "saving twice must not run the job twice"
-    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).status_code == 409
+    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).status_code == 200, "a done job can show its lines"
     assert len(finished) == 1
     assert client.get(f"/jobs/{'f' * 32}/segments", headers=AUTH).status_code == 404
     assert edit(client, "f" * 32, (0, "ក")).status_code == 404
+
+
+def reopen(client: TestClient, job_id: str, video: Path, name: str = "clip.mp4") -> httpx.Response:
+    """POST /jobs/{id}/reopen with the original video."""
+    with video.open("rb") as f:
+        return client.post(f"/jobs/{job_id}/reopen", headers=AUTH, files={"file": (name, f, "video/mp4")})
+
+
+def finished_job(client: TestClient, video: Path, **fields: str) -> str:
+    """A job that went through review to the end, and its id."""
+    job_id = in_review(client, video, **fields)
+    assert edit(client, job_id, (0, "ក")).status_code == 200
+    wait(client, job_id)
+    return job_id
+
+
+def test_a_finished_job_can_be_edited_and_made_again(client: TestClient, finished: list, work_dir: Path, tone_video: Path) -> None:
+    job_id = finished_job(client, tone_video, gender="female", original_volume="0.5")
+
+    response = reopen(client, job_id, tone_video)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "review"}
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).json() == {
+        "status": "review", "progress": 50, "message": "Waiting for your review", "error": None, "language": "en"
+    }
+    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).json()["segments"][0]["km"] == "ក"
+
+    body = {"segments": [{"id": 1, "km": "ថ្មី"}], "gender": "male", "original_volume": 0}
+    assert client.put(f"/jobs/{job_id}/segments", headers=AUTH, json=body).status_code == 200
+    assert wait(client, job_id)["status"] == "done"
+
+    again = finished[-1]
+    assert len(finished) == 2
+    assert (again["km"], again["gender"], again["original_volume"]) == (["ក", "ថ្មី"], "male", 0)
+    assert again["upload_kept"] is True
+    assert again["duration"] == pytest.approx(2, abs=0.5), "measured from the video sent again"
+    assert not (work_dir / job_id / "input.mp4").exists(), "the upload is tidied away again"
+
+
+def test_saving_leaves_out_choices_that_were_not_sent(client: TestClient, finished: list, tone_video: Path) -> None:
+    job_id = finished_job(client, tone_video, gender="male", original_volume="0.5")
+    assert reopen(client, job_id, tone_video).status_code == 200
+    assert edit(client, job_id, (0, "ខ")).status_code == 200
+    wait(client, job_id)
+    assert (finished[-1]["gender"], finished[-1]["original_volume"]) == ("male", 0.5)
+
+
+def test_a_refused_save_can_be_sent_again(client: TestClient, finished: list, tone_video: Path) -> None:
+    job_id = finished_job(client, tone_video)
+    assert reopen(client, job_id, tone_video).status_code == 200
+    assert edit(client, job_id, (0, ""), (1, "")).status_code == 422
+    assert reopen(client, job_id, tone_video).status_code == 200, "sending the video twice does no harm"
+    assert edit(client, job_id, (0, "ខ")).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "fields, problem",
+    [({"gender": "robot"}, "gender must be female or male"), ({"original_volume": 1.5}, "original_volume")],
+)
+def test_bad_choices_are_not_saved(client: TestClient, finished: list, tone_video: Path, fields: dict, problem: str) -> None:
+    job_id = in_review(client, tone_video)
+    response = client.put(f"/jobs/{job_id}/segments", headers=AUTH, json={"segments": [], **fields})
+    assert response.status_code == 422
+    assert problem in response.json()["detail"]
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).json()["status"] == "review"
+
+
+def test_reopen_refuses_what_it_cannot_use(client: TestClient, finished: list, tone_video: Path, tmp_path: Path) -> None:
+    job_id = finished_job(client, tone_video)
+    junk = tmp_path / "junk.mp4"
+    junk.write_bytes(b"not a video")
+
+    assert reopen(client, job_id, tone_video, name="clip.avi").status_code == 422
+    assert reopen(client, job_id, junk).status_code == 422
+    assert client.post(f"/jobs/{job_id}/reopen", headers=AUTH).status_code == 422
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).json()["status"] == "done"
+    assert reopen(client, "f" * 32, tone_video).status_code == 404
+
+    client.app.state.jobs.update(job_id, status="failed")
+    assert reopen(client, job_id, tone_video).status_code == 409
+
+
+def test_a_job_without_saved_lines_cannot_be_reopened(client: TestClient, runs: list, tone_video: Path) -> None:
+    job_id = upload(client, tone_video).json()["job_id"]  # the fake pipeline saves no lines
+    wait(client, job_id)
+    response = reopen(client, job_id, tone_video)
+    assert response.status_code == 409
+    assert "no saved lines" in response.json()["detail"]
+    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).status_code == 409
 
 
 def test_saving_while_the_job_is_still_running_is_409(client: TestClient, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:

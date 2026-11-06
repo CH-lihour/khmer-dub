@@ -145,6 +145,9 @@ How the voice is made and fitted:
   effects go up and down with the speech, because the original is one mixed track. 15% is about
   16 dB quieter. Because the level stays fixed, the original speech never gets loud between Khmer
   lines.
+- The upload form saves each account's voice, dub, original sound and edit choices as soon as one
+  changes, so they survive a refresh and follow the account to any browser. A new account starts with the Sreymom voice, dubbing on
+  and the original sound Off.
 - `ORIGINAL_VOLUME` in `worker/.env` is only the default for `POST /jobs` calls and scripts that
   send no level (`try_pipeline.py`, say). After changing it, run `docker compose up -d worker` so
   the worker reads `worker/.env` again.
@@ -177,8 +180,9 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 | --- | --- |
 | `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`) | `{"job_id": "<32 hex>"}` |
 | `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language"}` |
-| `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` |
-| `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km"}]}`) | `{"status": "queued"}`; saves the Khmer and resumes the job |
+| `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` or `done` |
+| `POST /jobs/{id}/reopen` (multipart `file`, the original video) | `{"status": "review"}`, to make a done job's results again |
+| `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km"}]}`, optional `gender`, `original_volume`) | `{"status": "queued"}`; saves the Khmer and choices and resumes the job |
 | `GET /jobs/{id}/download/srt` | `khmer.srt` |
 | `GET /jobs/{id}/download/video` | `dubbed.mp4` (only for `dub=true`) |
 | `POST /cleanup` (form `days`, default 7) | `{"deleted": <count>}` |
@@ -194,6 +198,7 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 - `gender` defaults to `female`, `dub` to `true`, `review` to `false` and `original_volume` to
   `ORIGINAL_VOLUME` when they are left out.
 - The review calls answer 409 for a job that is not in `review`, so saving twice cannot run it twice.
+  `reopen` answers 409 for a running or failed job, or one with no saved lines.
 - Jobs run one at a time on one worker thread, in upload order. Later uploads wait as `queued`.
 - Each job lives in `/data/jobs/<id>/` (the `worker_jobs` volume) with a `status.json`. After a
   restart, finished jobs can still be downloaded. A job that was queued or running when the
@@ -258,7 +263,10 @@ the key, and a text with no Khmer entry shows in English. A test fails if a page
 4. When a job has a dubbed video, the page plays it in a player with the Khmer subtitles, which
    you can turn off in the player. `GET /dub/<id>/preview/video` answers range requests so the
    player can seek, and `/preview/vtt` turns the SRT into WebVTT, the only format browsers read.
-   A subtitles-only job has no player. If a browser cannot play the video's codec (MP4 keeps the
+   Every dubbed video under **Your videos** has a **Play** button that opens it in the player, for
+   as long as its files are kept. **Play** and the video's name both stay on the page and glide to
+   the player over 0.7 s, and so does coming back from the edit page. A device set to reduce
+   motion goes straight there. A subtitles-only job has no player. If a browser cannot play the video's codec (MP4 keeps the
    upload's codec), the page says so and the download still works.
 
 A failed job shows the reason: the worker's own message (no speech, too long, voice service
@@ -281,6 +289,15 @@ Turn on **Edit the Khmer first** when uploading. Without it, a job runs straight
    A line with letters but no Khmer ones cannot be saved, because the Khmer voice cannot read it.
    Khmer with a Latin name in it, or a line of only digits, is fine.
 3. **Save and make the voice** (or **Save the subtitles**) resumes the job with your text.
+
+A finished dubbed video can be corrected later, too. Open it with **Play** and choose **Edit and
+regenerate**. The same page opens, with the voice and **Original sound** to change as well, and
+**Save and regenerate** makes a new voice and video from your text. Speech recognition and
+translation do not run again, so this takes about 2 seconds per line plus the mix. Only the Khmer
+can be edited, not the original text. The current video stays until the new one has arrived, and
+if making it fails, the old one stays and the page shows the reason. Editing works until the
+video's files are deleted, 7 days after upload, and regenerating does not extend that.
+Subtitles-only jobs cannot be edited this way yet.
 
 Your edits are kept if something goes wrong after saving. If the voice service is down or the
 worker restarts, the job returns to **Needs review** with the reason, and saving again retries it.

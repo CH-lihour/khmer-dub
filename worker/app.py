@@ -2,8 +2,10 @@
 
     POST /jobs                       multipart file, gender, dub, review, original_volume -> {"job_id": "<hex>"}
     GET  /jobs/{id}                  -> {"status", "progress", "message", "error", "language"}
-    GET  /jobs/{id}/segments         -> {"segments": [...]}, while the job waits for review
-    PUT  /jobs/{id}/segments         JSON {"segments": [{"id", "km"}]} -> saves the Khmer and resumes
+    GET  /jobs/{id}/segments         -> {"segments": [...]}, while the job is in review or done
+    PUT  /jobs/{id}/segments         JSON {"segments": [{"id", "km"}], "gender", "original_volume"}
+                                     -> saves the Khmer and the choices, and resumes
+    POST /jobs/{id}/reopen           multipart file (the original video) -> puts a done job back in review
     GET  /jobs/{id}/download/srt     -> khmer.srt
     GET  /jobs/{id}/download/video   -> dubbed.mp4
     POST /cleanup                    form days (default 7) -> {"deleted": <count>}
@@ -12,6 +14,8 @@
 Jobs run one at a time on a single worker thread. Each job has a folder WORK_DIR/<id>/ with a
 status.json next to its results, so finished jobs survive a restart of the worker. A job sent with
 review=true stops after translation with status "review", holding no thread, until its Khmer is saved.
+A finished job can come back to "review" with POST /jobs/{id}/reopen, to make its results again from
+edited Khmer. The upload was tidied away when it finished, so Laravel sends the video again.
 """
 
 import hmac
@@ -37,7 +41,7 @@ from pydantic import BaseModel, Field
 import config
 import pipeline
 from stages import StageError, has_other_script_only
-from stages.audio import check_video
+from stages.audio import check_video, extract_audio
 from stages.tts import VOICES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -54,6 +58,8 @@ RESTARTED_REVIEW = "The worker restarted before the results were ready."
 REVIEW_PROGRESS = 50  # between the translate (45) and voice (60) milestones
 REVIEW_MESSAGE = "Waiting for your review"
 NOT_IN_REVIEW = "This job is not waiting for review."
+NOT_EDITABLE = "This job cannot be edited now. Only a finished job or one waiting for review can."
+NO_LINES = "This job has no saved lines to edit. Please upload the video again."
 MAX_LINE_CHARS = 2000
 
 
@@ -65,9 +71,11 @@ class EditedLine(BaseModel):
 
 
 class Edits(BaseModel):
-    """The body of PUT /jobs/{id}/segments. Lines left out keep their text."""
+    """The body of PUT /jobs/{id}/segments. Lines left out keep their text; choices left out stay as they are."""
 
     segments: list[EditedLine]
+    gender: str | None = None
+    original_volume: float | None = Field(default=None, ge=0, le=1)
 
 
 class JobStore:
@@ -109,15 +117,18 @@ class JobStore:
         with self._lock:
             self._set(job_id, **fields)
 
-    def resume(self, job_id: str, edits: list[EditedLine]) -> None:
-        """Save the reviewed Khmer of a job in review and put it in line to make the results.
+    def resume(self, job_id: str, edits: Edits) -> None:
+        """Save the reviewed Khmer and choices of a job in review and put it in line to make the results.
 
-        Answers 422 for a line id the job does not have or if every line would be empty, and 409 if
-        the job is not (or no longer) waiting for review, so saving twice cannot run it twice.
+        Answers 422 for a line id the job does not have, an unknown voice, or if every line would be
+        empty, and 409 if the job is not (or no longer) waiting for review, so saving twice cannot
+        run it twice.
         """
+        if edits.gender is not None and edits.gender not in VOICES:
+            raise HTTPException(422, "gender must be female or male.")
         folder = self.work_dir / job_id
         segments = pipeline.load_segments(folder)
-        changed = {line.id: line.km.strip() for line in edits}
+        changed = {line.id: line.km.strip() for line in edits.segments}
         unknown = changed.keys() - {seg["id"] for seg in segments}
         if unknown:
             raise HTTPException(422, f"These lines are not part of this job: {sorted(unknown)}.")
@@ -133,7 +144,9 @@ class JobStore:
             if self._jobs[job_id]["status"] != "review":
                 raise HTTPException(409, NOT_IN_REVIEW)
             pipeline.save_segments(folder, segments)
-            self._set(job_id, status="queued", message="Waiting in the queue", error=None)
+            choices = {"gender": edits.gender, "original_volume": edits.original_volume}
+            self._set(job_id, status="queued", message="Waiting in the queue", error=None,
+                      **{key: value for key, value in choices.items() if value is not None})
         self._executor.submit(self._finish, job_id)
 
     def cleanup(self, days: float) -> list[str]:
@@ -344,10 +357,12 @@ def job_status(job_id: str, request: Request) -> dict:
 
 @app.get("/jobs/{job_id}/segments")
 def job_segments(job_id: str, request: Request) -> dict[str, list[dict]]:
-    """Return the lines of a job waiting for review: {"segments": [{id, start, end, text, km}]}. Else 409."""
-    if _find(request, job_id)["status"] != "review":
+    """Return the lines of a job in review or done: {"segments": [{id, start, end, text, km}]}. Else 409."""
+    if _find(request, job_id)["status"] not in ("review", "done"):
         raise HTTPException(409, NOT_IN_REVIEW)
     folder = request.app.state.jobs.work_dir / job_id
+    if not (folder / "segments.json").is_file():
+        raise HTTPException(409, NO_LINES)
     fields = ("id", "start", "end", "text", "km")
     return {"segments": [{key: seg[key] for key in fields} for seg in pipeline.load_segments(folder)]}
 
@@ -357,8 +372,43 @@ def save_segments(job_id: str, edits: Edits, request: Request) -> dict[str, str]
     """Save the reviewed Khmer of a job in review and resume it. An empty line is dropped. Else 409."""
     if _find(request, job_id)["status"] != "review":
         raise HTTPException(409, NOT_IN_REVIEW)
-    request.app.state.jobs.resume(job_id, edits.segments)
+    request.app.state.jobs.resume(job_id, edits)
     return {"status": "queued"}
+
+
+@app.post("/jobs/{job_id}/reopen")
+def reopen_job(job_id: str, request: Request, file: Annotated[UploadFile | None, File()] = None) -> dict[str, str]:
+    """Take the original video of a job again and put it in review, to make its results again.
+
+    Its Khmer lines and its results stay as they are until PUT /jobs/{id}/segments is done. Works
+    on a job in review too, so a refused save can simply be sent again. Answers 409 for a job that
+    is running, failed or has no saved lines, and 422 for a missing or unreadable video.
+    """
+    job, jobs = _find(request, job_id), request.app.state.jobs
+    folder = jobs.work_dir / job_id
+    if job["status"] not in ("done", "review"):
+        raise HTTPException(409, NOT_EDITABLE)
+    if not (folder / "segments.json").is_file():
+        raise HTTPException(409, NO_LINES)
+    if file is None or not file.filename:
+        raise HTTPException(422, "No video was sent. Attach it as the multipart field 'file'.")
+    extension = Path(file.filename).suffix.lower()
+    if extension not in FORMATS:
+        raise HTTPException(422, f"Unsupported file type '{extension or 'none'}'. Upload an MP4, MOV, MKV or WebM video.")
+
+    upload = folder / f"input{extension}"
+    try:
+        _save(file, upload)
+        # A job that never stopped for review has no saved length, and some files store none.
+        duration = check_video(upload) or extract_audio(upload, folder / "audio.wav")
+    except StageError as exc:
+        upload.unlink(missing_ok=True)
+        raise HTTPException(422, str(exc)) from exc
+
+    jobs.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, error=None,
+                upload=upload.name, duration=duration)
+    log.info("Job %s reopened for editing", job_id)
+    return {"status": "review"}
 
 
 @app.get("/jobs/{job_id}/download/srt")

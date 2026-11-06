@@ -178,6 +178,39 @@ class ProcessVideoJobTest extends TestCase
         $this->assertSame(['review', 'The voice service could not be reached.'], [$row->status, $row->error]);
     }
 
+    public function test_a_video_made_again_replaces_the_old_results(): void
+    {
+        Storage::disk('local')->put('results/1/dubbed.mp4', 'old video');
+        Storage::disk('local')->put('results/1/khmer.srt', 'old subtitles');
+        $row = $this->upload(['status' => 'queued', 'progress' => 50, 'worker_job_id' => 'w1', 'video_path' => 'results/1/dubbed.mp4', 'srt_path' => 'results/1/khmer.srt']);
+        $this->fakeWorker([['status' => 'done', 'progress' => 100, 'language' => 'en']]);
+
+        $this->assertNull($this->process($row));
+
+        $row->refresh();
+        $this->assertSame(['done', null], [$row->status, $row->error]);
+        $this->assertSame('fake mp4', Storage::disk('local')->get('results/1/dubbed.mp4'));
+        $this->assertSame(self::SRT, Storage::disk('local')->get('results/1/khmer.srt'));
+        Storage::disk('local')->assertMissing('results/1/dubbed.mp4.part');
+    }
+
+    public function test_a_failed_download_keeps_the_old_results_and_shows_the_reason(): void
+    {
+        Storage::disk('local')->put('results/1/dubbed.mp4', 'old video');
+        Storage::disk('local')->put('results/1/khmer.srt', 'old subtitles');
+        $row = $this->upload(['status' => 'queued', 'progress' => 50, 'worker_job_id' => 'w1', 'video_path' => 'results/1/dubbed.mp4', 'srt_path' => 'results/1/khmer.srt']);
+        $this->fakeWorker([['status' => 'done', 'progress' => 100, 'language' => 'en']], [
+            'worker.test/jobs/w1/download/video' => Http::response(['detail' => 'The result file is no longer on the worker.'], 404),
+        ]);
+
+        $this->assertInstanceOf(DubbingFailed::class, $this->process($row));
+
+        $row->refresh();
+        $this->assertSame(['done', 100, 'The result file is no longer on the worker.'], [$row->status, $row->progress, $row->error]);
+        $this->assertSame('old video', Storage::disk('local')->get('results/1/dubbed.mp4'));
+        $this->assertSame('old subtitles', Storage::disk('local')->get('results/1/khmer.srt'));
+    }
+
     public function test_the_worker_refusing_the_video_fails_the_job_with_its_reason(): void
     {
         $row = $this->upload();

@@ -49,7 +49,7 @@ class ProcessVideoJob implements ShouldQueue
      *
      * A review can take days, so the job ends there instead of holding the queue. Saving the review
      * dispatches it again, and it goes on following the same worker job. Any exception ends in
-     * failed(), which marks the row as failed.
+     * failed(). New results replace old ones only once both have arrived.
      */
     public function handle(): void
     {
@@ -73,21 +73,30 @@ class ProcessVideoJob implements ShouldQueue
 
         $job->update(['progress' => 99, 'message' => 'Downloading the results']);
         $folder = $job->resultsFolder();
-        $srt = $this->download($workerId, 'srt', "{$folder}/khmer.srt");
-        $video = $job->dub ? $this->download($workerId, 'video', "{$folder}/dubbed.mp4") : null;
+        $files = ['srt' => "{$folder}/khmer.srt"] + ($job->dub ? ['video' => "{$folder}/dubbed.mp4"] : []);
+        foreach ($files as $kind => $path) {
+            $this->download($workerId, $kind, "{$path}.part");
+        }
+        foreach ($files as $path) {
+            Storage::disk('local')->move("{$path}.part", $path);
+        }
 
         $job->update([
-            'status' => VideoJob::DONE, 'progress' => 100, 'message' => 'Done', 'language' => $language,
-            'srt_path' => $srt, 'video_path' => $video,
+            'status' => VideoJob::DONE, 'progress' => 100, 'message' => 'Done', 'language' => $language, 'error' => null,
+            'srt_path' => $files['srt'], 'video_path' => $files['video'] ?? null,
         ]);
     }
 
     /**
-     * Mark the row as failed with a reason the user can act on.
+     * Mark the row as failed with a reason the user can act on. If making a video again failed, the
+     * old one is still good, so the job stays done and only shows the reason.
      */
     public function failed(?Throwable $exception): void
     {
-        $this->videoJob->update(['status' => VideoJob::FAILED, 'message' => 'Failed', 'error' => self::reason($exception)]);
+        $outcome = $this->videoJob->video_path !== null
+            ? ['status' => VideoJob::DONE, 'progress' => 100, 'message' => 'Done']
+            : ['status' => VideoJob::FAILED, 'message' => 'Failed'];
+        $this->videoJob->update([...$outcome, 'error' => self::reason($exception)]);
     }
 
     /**

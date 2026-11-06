@@ -4,6 +4,7 @@
         'uploading' => __('Uploading'),
         'review' => __('Review'),
         'off' => __('Off'),
+        'play' => __('Play'),
         'justNow' => __('just now'),
         'chooseFile' => __('Choose a video file.'),
         'signedOut' => __('You are signed out. Reload the page and log in again.'),
@@ -14,7 +15,9 @@
         'uploadFailed' => __('The upload failed (HTTP :status). Please try again.'),
         'unreachable' => __('The site could not be reached. Check that it is running and try again.'),
     ];
-    $originalVolume = (float) old('original_volume', 0);
+    $originalVolume = (float) old('original_volume', $options['original_volume']);
+    $gender = old('gender', $options['gender']);
+    $dubbing = $errors->any() ? old('dub') : $options['dub'];
 @endphp
 <x-app-layout>
     <section class="hero">
@@ -31,27 +34,15 @@
                     <span id="drop-name" class="drop-name"></span>
                 </label>
 
-                <fieldset class="field">
-                    <legend class="unseen">{{ __('Voice') }}</legend>
-                    <div class="voices">
-                        <label><input type="radio" name="gender" value="female" @checked(old('gender', 'female') === 'female')>
-                            <span><b>{{ __('Sreymom') }}</b> <small>{{ __('Female') }}</small></span></label>
-                        <label><input type="radio" name="gender" value="male" @checked(old('gender') === 'male')>
-                            <span><b>{{ __('Piseth') }}</b> <small>{{ __('Male') }}</small></span></label>
-                    </div>
-                </fieldset>
+                <x-voice-choice :selected="$gender" />
 
                 <label class="toggle">
-                    <input type="checkbox" name="dub" value="1" @checked(! $errors->any() || old('dub'))><i></i>
+                    <input type="checkbox" name="dub" value="1" @checked($dubbing)><i></i>
                     <span>{{ __('Dub the video') }}</span>
                 </label>
-                <div id="original-sound" class="level">
-                    <label for="original-volume">{{ __('Original sound') }}</label>
-                    <output id="original-level" for="original-volume">{{ $originalVolume > 0 ? round($originalVolume * 100).'%' : __('Off') }}</output>
-                    <input id="original-volume" type="range" name="original_volume" min="0" max="1" step="0.05" value="{{ $originalVolume }}">
-                </div>
+                <x-original-sound :level="$originalVolume" :off="! $dubbing" />
                 <label class="toggle">
-                    <input type="checkbox" name="review" value="1" @checked(old('review'))><i></i>
+                    <input type="checkbox" name="review" value="1" @checked($errors->any() ? old('review') : $options['review'])><i></i>
                     <span>{{ __('Edit the Khmer first') }}</span>
                 </label>
 
@@ -80,6 +71,7 @@
             <p id="job-player-error" class="error" hidden>{{ __('This browser cannot play the video. Download it instead.') }}</p>
             <div class="links">
                 <a id="job-review" class="button sun" href="{{ $current['review_url'] ?? '#' }}" @if (empty($current['review_url'])) hidden @endif>{{ __('Check the Khmer') }}</a>
+                <a id="job-edit" class="button sun" href="{{ $current['edit_url'] ?? '#' }}" @if (empty($current['edit_url'])) hidden @endif>{{ __('Edit and regenerate') }}</a>
                 <a id="job-video" class="button" href="{{ $current['video_url'] ?? '#' }}" @if (empty($current['video_url'])) hidden @endif>↓ {{ __('Video') }}</a>
                 <a id="job-srt" class="button jade" href="{{ $current['srt_url'] ?? '#' }}" @if (empty($current['srt_url'])) hidden @endif>↓ {{ __('Subtitles') }}</a>
             </div>
@@ -92,10 +84,11 @@
                     <tbody id="history">
                     @forelse ($jobs as $job)
                         <tr data-id="{{ $job->id }}">
-                            <td class="name"><a href="{{ route('dub.index', ['job' => $job->id]) }}">{{ $job->original_name }}</a></td>
+                            <td class="name"><a href="{{ route('dub.index', ['job' => $job->id]) }}" data-status-url="{{ route('dub.status', $job) }}">{{ $job->original_name }}</a></td>
                             <td class="when">{{ $job->created_at?->diffForHumans() }}</td>
                             <td><span class="pill s-{{ $job->status }}" @if ($job->status === 'done') hidden @endif>{{ $statusLabel[$job->status] ?? $job->status }}</span></td>
                             <td class="results">
+                                @if ($job->hasPlayableVideo())<a class="play" href="{{ route('dub.index', ['job' => $job->id]) }}" data-status-url="{{ route('dub.status', $job) }}">▶ {{ __('Play') }}</a>@endif
                                 @if ($job->status === 'review')<a href="{{ route('dub.review', $job) }}">{{ __('Review') }}</a>@endif
                                 @if ($job->srt_path)<a href="{{ route('dub.download', [$job, 'srt']) }}">SRT</a>@endif
                                 @if ($job->video_path)<a href="{{ route('dub.download', [$job, 'video']) }}">MP4</a>@endif
@@ -120,10 +113,11 @@
         const STATUS = @json($statusLabel);
         const TEXT = @json($texts);
         const POLL_MS = 3000;
+        const GLIDE_MS = 700;
         const $ = (id) => document.getElementById(id);
         const form = $('upload'), start = $('start'), errors = $('errors'), video = $('video'), drop = $('drop');
         const level = $('original-volume'), dub = form.elements.dub;
-        let timer = null;
+        let timer = null, glide = null, saving = false, changed = false;
 
         function showErrors(list) {
             errors.replaceChildren(...list.map((text) => Object.assign(document.createElement('li'), { textContent: text })));
@@ -142,8 +136,9 @@
             const text = percent ? `${percent}%` : TEXT.off;
             $('original-level').textContent = text;
             level.setAttribute('aria-valuetext', text);
+            level.style.setProperty('--fill', `${percent}%`);
             level.disabled = !dub.checked;
-            $('original-sound').hidden = !dub.checked;
+            $('original-sound').classList.toggle('off', !dub.checked);
         }
 
         /** Load the job's dubbed video into the player, or empty and hide the player if it has none. */
@@ -176,7 +171,7 @@
             $('job-language').hidden = !job.language_name;
             $('job-language').querySelector('b').textContent = job.language_name || '';
             showPlayer(job);
-            for (const [id, url] of [['job-review', job.review_url], ['job-srt', job.srt_url], ['job-video', job.video_url]]) {
+            for (const [id, url] of [['job-review', job.review_url], ['job-edit', job.edit_url], ['job-srt', job.srt_url], ['job-video', job.video_url]]) {
                 $(id).hidden = !url;
                 $(id).href = url || '#';
             }
@@ -192,6 +187,7 @@
                 row.innerHTML = '<td class="name"><a></a></td><td class="when"></td><td><span class="pill"></span></td><td class="results"></td>';
                 row.querySelector('a').textContent = job.name;
                 row.querySelector('a').href = `?job=${job.id}`;
+                row.querySelector('a').dataset.statusUrl = job.status_url;
                 row.querySelector('.when').textContent = TEXT.justNow;
                 $('history').prepend(row);
             }
@@ -199,13 +195,69 @@
             pill.className = `pill s-${job.status}`;
             pill.hidden = job.status === 'done'; // the download links say that already
             pill.textContent = STATUS[job.status] || job.status;
-            const links = [[job.review_url, TEXT.review], [job.srt_url, 'SRT'], [job.video_url, 'MP4']].filter(([url]) => url)
+            const links = [[job.preview_url && `?job=${job.id}`, `▶ ${TEXT.play}`], [job.review_url, TEXT.review], [job.srt_url, 'SRT'], [job.video_url, 'MP4']]
+                .filter(([url]) => url)
                 .map(([url, text]) => Object.assign(document.createElement('a'), { href: url, textContent: text }));
+            if (job.preview_url) { // the first link, as listed above
+                links[0].className = 'play';
+                links[0].dataset.statusUrl = job.status_url;
+            }
             row.querySelector('.results').replaceChildren(...links.flatMap((a) => [a, ' ']));
         }
 
         /** True once nothing will change until the user acts. */
         const stopped = (status) => ['done', 'failed', 'review'].includes(status);
+
+        /** Where the page must be scrolled to for `element` to be centred, or to show its top if it is too tall. */
+        function centredAt(element) {
+            const box = element.getBoundingClientRect();
+            return scrollY + box.top - Math.max(0, (innerHeight - box.height) / 2);
+        }
+
+        /**
+         * Scroll to `element` over GLIDE_MS, measuring it again on every frame because the page can
+         * still be changing. The browser's own smooth scroll sets its own speed, which over this
+         * distance looks like a jump. Scrolling by hand stops the glide.
+         */
+        function glideTo(element) {
+            cancelGlide();
+            if (matchMedia('(prefers-reduced-motion: reduce)').matches) return scrollTo(0, centredAt(element));
+            const from = scrollY, started = performance.now();
+            const step = (now) => {
+                const t = Math.min(Math.max(now - started, 0) / GLIDE_MS, 1);
+                const eased = t < .5 ? 4 * t ** 3 : 1 - (2 - 2 * t) ** 3 / 2;
+                scrollTo(0, from + (centredAt(element) - from) * eased);
+                glide = t < 1 ? requestAnimationFrame(step) : null;
+            };
+            glide = requestAnimationFrame(step);
+        }
+
+        function cancelGlide() {
+            cancelAnimationFrame(glide);
+            glide = null;
+        }
+
+        /** Bring the whole player with its controls into view, or the progress card when there is no video. */
+        function showJob() {
+            const player = $('job-player');
+            const go = () => glideTo(player.hidden ? $('job') : player);
+            if (player.hidden || player.readyState >= HTMLMediaElement.HAVE_METADATA) return go();
+            const wait = new AbortController(); // the player's height is unknown until then
+            for (const name of ['loadedmetadata', 'error']) {
+                player.addEventListener(name, () => { wait.abort(); go(); }, { signal: wait.signal });
+            }
+        }
+
+        /** Open a video from the history without leaving the page. Ctrl or Shift click still opens the link. */
+        $('history').addEventListener('click', async (event) => {
+            const link = event.target.closest('a[data-status-url]');
+            if (!link || event.ctrlKey || event.metaKey || event.shiftKey) return;
+            event.preventDefault();
+            history.replaceState(null, '', link.href);
+            await poll(link.dataset.statusUrl);
+            showJob();
+            if (link.classList.contains('play')) $('job-player').play().catch(() => {}); // a browser may refuse; its own button still works
+        });
 
         /** Ask for the job's status every 3 seconds until it stops. */
         async function poll(url) {
@@ -233,11 +285,34 @@
             event.target.hidden = true;
             $('job-player-error').hidden = false;
         });
+        for (const name of ['wheel', 'touchstart', 'keydown']) addEventListener(name, cancelGlide, { passive: true });
         level.addEventListener('input', showLevel);
         dub.addEventListener('change', showLevel);
         showLevel();
         for (const name of ['dragenter', 'dragover']) drop.addEventListener(name, () => drop.classList.add('over'));
         for (const name of ['dragleave', 'drop']) drop.addEventListener(name, () => drop.classList.remove('over'));
+
+        /**
+         * Save the choices to the account at once, so they survive a refresh. One save at a time,
+         * always of the latest choices, so an older save can never finish last and undo a newer one.
+         */
+        async function saveChoices() {
+            changed = true;
+            if (saving) return;
+            saving = true;
+            while (changed) {
+                changed = false;
+                const choices = new FormData(form);
+                choices.delete('video');
+                await fetch(@json(route('dub.options')), { method: 'POST', body: choices, headers: { Accept: 'application/json' }, keepalive: true })
+                    .catch(() => {}); // the choice still applies to this upload; only remembering it failed
+            }
+            saving = false;
+        }
+
+        form.addEventListener('change', (event) => {
+            if (event.target !== video) saveChoices();
+        });
 
         form.addEventListener('submit', async (event) => {
             event.preventDefault();
@@ -252,9 +327,8 @@
                 if (response.status === 201) {
                     const { id, status_url: url } = await response.json();
                     history.replaceState(null, '', `?job=${id}`);
-                    form.reset();
+                    video.value = ''; // only the file: the choices stay for the next video
                     showFile();
-                    showLevel();
                     poll(url);
                     return;
                 }
@@ -283,6 +357,9 @@
         if (current) {
             render(current);
             if (!stopped(current.status)) poll(current.status_url);
+            // Arriving from the edit page or a link. A refresh keeps its place, and so does a plain /dub.
+            const arrived = performance.getEntriesByType('navigation')[0]?.type === 'navigate';
+            if (arrived && new URLSearchParams(location.search).has('job')) showJob();
         }
     })();
     </script>

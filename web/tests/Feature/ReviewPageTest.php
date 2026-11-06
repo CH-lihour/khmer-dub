@@ -117,6 +117,120 @@ class ReviewPageTest extends TestCase
         Queue::assertPushed(ProcessVideoJob::class, fn (ProcessVideoJob $pushed) => $pushed->videoJob->is($job));
     }
 
+    /**
+     * A finished dubbed video on the worker as "w1", with its upload and results here.
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    private function finished(array $attributes = []): VideoJob
+    {
+        Storage::disk('local')->put('uploads/abc.mp4', 'video bytes');
+        Storage::disk('local')->put('results/1/dubbed.mp4', 'old video');
+
+        return $this->waiting([
+            'status' => 'done', 'progress' => 100, 'message' => 'Done', 'gender' => 'female', 'original_volume' => 0.15,
+            'video_path' => 'results/1/dubbed.mp4', 'srt_path' => 'results/1/khmer.srt', ...$attributes,
+        ]);
+    }
+
+    public function test_a_finished_video_can_be_opened_for_editing(): void
+    {
+        Http::fake(['worker.test/jobs/w1/segments' => Http::response(['segments' => [['id' => 0, 'start' => 1.0, 'end' => 2.0, 'text' => 'Hello', 'km' => 'សួស្តី']]])]);
+
+        $this->get(route('dub.review', $this->finished()))->assertOk()
+            ->assertSee('Save and regenerate')->assertSee('The current video stays')->assertSee('សួស្តី')
+            ->assertSee('value="female" checked', false)->assertSee('step="0.05" value="0.15"', false)->assertSee('15%');
+    }
+
+    public function test_saving_a_finished_video_sends_it_again_then_the_edits_and_keeps_the_old_one_for_now(): void
+    {
+        Http::fake([
+            'worker.test/jobs/w1/reopen' => Http::response(['status' => 'review']),
+            'worker.test/jobs/w1/segments' => Http::response(['status' => 'queued']),
+        ]);
+        $job = $this->finished(['error' => 'An earlier failure.']);
+
+        $this->post(route('dub.review.save', $job), ['km' => [0 => 'ថ្មី'], 'gender' => 'male', 'original_volume' => '0.4'])
+            ->assertRedirect(route('dub.index', ['job' => $job->id]));
+
+        $sent = Http::recorded()->map(fn (array $pair) => $pair[0]);
+        $this->assertSame(
+            ['POST http://worker.test/jobs/w1/reopen', 'PUT http://worker.test/jobs/w1/segments'],
+            $sent->map(fn (Request $request) => "{$request->method()} {$request->url()}")->all(),
+        );
+        $this->assertTrue($sent[0]->isMultipart() && $sent[0]->hasFile('file', null, 'abc.mp4'));
+        $this->assertSame(['segments' => [['id' => 0, 'km' => 'ថ្មី']], 'gender' => 'male', 'original_volume' => 0.4], $sent[1]->data());
+        $job->refresh();
+        $this->assertSame(
+            ['queued', 50, null, 'male', 0.4, 'results/1/dubbed.mp4'],
+            [$job->status, $job->progress, $job->error, $job->gender, $job->original_volume, $job->video_path],
+        );
+        Storage::disk('local')->assertExists('results/1/dubbed.mp4');
+        Queue::assertPushed(ProcessVideoJob::class, fn (ProcessVideoJob $pushed) => $pushed->videoJob->is($job));
+    }
+
+    public function test_a_refused_regeneration_leaves_the_finished_video_as_it_was(): void
+    {
+        Http::fake([
+            'worker.test/jobs/w1/reopen' => Http::response(['status' => 'review']),
+            'worker.test/jobs/w1/segments' => Http::response(['detail' => 'Every line is empty. Keep the Khmer text of at least one line.'], 422),
+        ]);
+        $job = $this->finished();
+
+        $this->from(route('dub.review', $job))->post(route('dub.review.save', $job), ['km' => [0 => '']])
+            ->assertRedirect(route('dub.review', $job))->assertSessionHasErrors('review')->assertSessionHasInput('km');
+
+        $this->assertSame(['done', 100, 'female'], [$job->fresh()->status, $job->fresh()->progress, $job->fresh()->gender]);
+        Queue::assertNothingPushed();
+    }
+
+    public function test_regenerating_needs_the_upload(): void
+    {
+        Http::fake();
+        $job = $this->finished();
+        Storage::disk('local')->delete('uploads/abc.mp4');
+
+        $this->from(route('dub.review', $job))->post(route('dub.review.save', $job), ['km' => [0 => 'ក']])
+            ->assertSessionHasErrors(['review' => 'The uploaded video is missing on the server. Please upload it again.']);
+
+        Http::assertNothingSent();
+    }
+
+    public function test_regenerating_needs_the_worker_job(): void
+    {
+        Http::fake(['worker.test/jobs/w1/reopen' => Http::response(['detail' => 'Unknown job id.'], 404)]);
+        $job = $this->finished();
+
+        $this->from(route('dub.review', $job))->post(route('dub.review.save', $job), ['km' => [0 => 'ក']])
+            ->assertSessionHasErrors(['review' => 'The worker no longer has this job. Please upload the video again.']);
+
+        $this->assertSame('done', $job->fresh()->status);
+        Http::assertSentCount(1);
+    }
+
+    public function test_bad_choices_are_refused_before_the_video_is_sent(): void
+    {
+        Http::fake();
+        $job = $this->finished();
+
+        $this->post(route('dub.review.save', $job), ['km' => [0 => 'ក'], 'gender' => 'robot'])->assertSessionHasErrors('gender');
+        $this->post(route('dub.review.save', $job), ['km' => [0 => 'ក'], 'original_volume' => '2'])->assertSessionHasErrors('original_volume');
+
+        Http::assertNothingSent();
+    }
+
+    public function test_only_finished_dubbed_videos_can_be_regenerated(): void
+    {
+        $subtitles = $this->waiting(['status' => 'done', 'dub' => false, 'srt_path' => 'results/1/khmer.srt']);
+        $running = $this->finished(['status' => 'processing']);
+
+        foreach ([$subtitles, $running] as $job) {
+            $this->get(route('dub.review', $job))->assertRedirect(route('dub.index', ['job' => $job->id]));
+            $this->post(route('dub.review.save', $job), ['km' => [0 => 'ក']])->assertRedirect(route('dub.index', ['job' => $job->id]));
+        }
+        Queue::assertNothingPushed();
+    }
+
     public function test_a_worker_refusal_keeps_the_typed_text(): void
     {
         Http::fake(['worker.test/jobs/w1/segments' => Http::response(['detail' => 'Every line is empty. Keep the Khmer text of at least one line.'], 422)]);

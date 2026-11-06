@@ -15,6 +15,7 @@
     "Check the Khmer": "ពិនិត្យភាសាខ្មែរ",
     "Video": "វីដេអូ",
     "Khmer": "ខ្មែរ",
+    "Play": "ចាក់",
     "This browser cannot play the video. Download it instead.": "កម្មវិធីរុករកនេះមិនអាចចាក់វីដេអូបានទេ។ សូមទាញយកវាជំនួសវិញ។",
     "Subtitles": "អក្សររត់",
     "Your videos": "វីដេអូរបស់អ្នក",
@@ -58,6 +59,10 @@
     "Your edits are saved. Save again to retry.": "ការកែប្រែរបស់អ្នកត្រូវបានរក្សាទុក។ សូមរក្សាទុកម្តងទៀត ដើម្បីសាកល្បងឡើងវិញ។",
     "Save and make the voice": "រក្សាទុក ហើយបង្កើតសំឡេង",
     "Save the subtitles": "រក្សាទុកអក្សររត់",
+    "Edit and regenerate": "កែ ហើយបង្កើតឡើងវិញ",
+    "Save and regenerate": "រក្សាទុក ហើយបង្កើតឡើងវិញ",
+    "The current video stays until the new one is ready. You can edit it until its files are deleted, 7 days after upload.": "វីដេអូបច្ចុប្បន្ននៅដដែល រហូតដល់វីដេអូថ្មីរួចរាល់។ អ្នកអាចកែវាបាន រហូតដល់ឯកសារត្រូវលុប គឺ 7 ថ្ងៃក្រោយពេលផ្ទុកឡើង។",
+    "The uploaded video is missing on the server. Please upload it again.": "វីដេអូដែលបានផ្ទុកឡើងបាត់ពីម៉ាស៊ីនមេ។ សូមផ្ទុកវាឡើងម្តងទៀត។",
     "Back": "ត្រឡប់ក្រោយ",
     "A line can have at most 2000 characters.": "បន្ទាត់មួយអាចមានយ៉ាងច្រើន 2000 តួអក្សរ។",
 

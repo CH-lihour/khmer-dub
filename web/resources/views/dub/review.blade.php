@@ -7,6 +7,9 @@
     <div class="wrap page" style="max-width: 58rem; padding-bottom: 0">
         <h1>{{ __('Check the Khmer') }}</h1>
         <p class="lead">{{ __('Empty a line to remove it.') }}</p>
+        @if ($job->video_path)
+            <p class="hint">{{ __('The current video stays until the new one is ready. You can edit it until its files are deleted, 7 days after upload.') }}</p>
+        @endif
 
         @if ($job->error)
             <p class="errors">{{ __($job->error) }} {{ __('Your edits are saved. Save again to retry.') }}</p>
@@ -32,10 +35,34 @@
                 @endforeach
             </ol>
 
+            @if ($job->dub)
+                <div class="panel">
+                    <x-voice-choice :selected="old('gender', $job->gender)" />
+                    <x-original-sound :level="(float) old('original_volume', $job->original_volume)" />
+                </div>
+            @endif
+
             <div class="savebar">
-                <button type="submit">{{ $job->dub ? __('Save and make the voice') : __('Save the subtitles') }}</button>
+                <button type="submit">{{ $job->video_path ? __('Save and regenerate') : ($job->dub ? __('Save and make the voice') : __('Save the subtitles')) }}</button>
                 <a href="{{ route('dub.index', ['job' => $job->id]) }}">{{ __('Back') }}</a>
             </div>
         </form>
     </div>
+
+    @if ($job->dub)
+        <x-slot name="scripts">
+        <script>
+        (() => {
+            const level = document.getElementById('original-volume'), label = document.getElementById('original-level');
+            const off = @json(__('Off'));
+            level.addEventListener('input', () => {
+                const percent = Math.round(level.value * 100);
+                label.textContent = percent ? `${percent}%` : off;
+                level.setAttribute('aria-valuetext', label.textContent);
+                level.style.setProperty('--fill', `${percent}%`);
+            });
+        })();
+        </script>
+        </x-slot>
+    @endif
 </x-app-layout>

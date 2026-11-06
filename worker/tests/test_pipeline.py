@@ -84,6 +84,31 @@ def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.Mon
     assert result["srt"].exists()
 
 
+def test_making_a_job_again_forgets_the_voice_of_an_emptied_line(
+    fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    pipeline.save_segments(job, [
+        {"id": 0, "start": 0.0, "end": 1.0, "text": "a", "km": "", "clip": "clips/0.wav", "speed": 1.2, "cut_ms": 0, "dub_end": 1.0},
+        {"id": 1, "start": 1.0, "end": 2.0, "text": "b", "km": "ខ", "clip": "clips/1.wav"},
+    ])
+    placed: list[str | None] = []
+
+    def build_track(segments: list[dict], total_ms: int, folder: Path) -> Path:
+        placed.extend(seg.get("clip") for seg in segments)
+        return folder / "dub.wav"
+
+    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender: segments)
+    monkeypatch.setattr(pipeline, "build_track", build_track)
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
+
+    pipeline.finish(job, "in.mp4", "female", True, 2.0, lambda p, m: None)
+
+    assert placed == [None, None]
+    assert "speed" not in pipeline.load_segments(job)[0]
+
+
 def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voice(
     fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
