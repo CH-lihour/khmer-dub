@@ -14,6 +14,8 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
+use Symfony\Component\HttpFoundation\BinaryFileResponse;
+use Symfony\Component\HttpFoundation\Response as HttpResponse;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
@@ -54,12 +56,14 @@ class VideoJobController extends Controller
             'gender' => ['sometimes', 'in:male,female'],
             'dub' => ['sometimes', 'boolean'],
             'review' => ['sometimes', 'boolean'],
+            'original_volume' => ['sometimes', 'numeric', 'between:0,1'],
         ], [
             'video.required' => __('Choose a video file.'),
             'video.uploaded' => __('The video did not upload completely. It may be larger than 500 MB.'),
             'video.mimes' => __('This file type is not supported. Upload an MP4, MOV, MKV or WebM video.'),
             'video.max' => __('The video is larger than 500 MB.'),
             'gender.in' => __('Choose the female or the male voice.'),
+            'original_volume.*' => __('Choose an original sound level from 0 to 100%.'),
         ]);
 
         $file = $request->file('video');
@@ -74,6 +78,7 @@ class VideoJobController extends Controller
             'gender' => $data['gender'] ?? 'female',
             'dub' => $request->boolean('dub'),
             'review' => $request->boolean('review'),
+            'original_volume' => $data['original_volume'] ?? 0,
             'message' => 'Waiting in the queue',
         ]);
         ProcessVideoJob::dispatch($job);
@@ -102,10 +107,23 @@ class VideoJobController extends Controller
     public function download(Request $request, VideoJob $job, string $kind): StreamedResponse
     {
         $this->authorizeOwner($request, $job);
-        $path = $kind === 'srt' ? $job->srt_path : $job->video_path;
-        abort_if($path === null || ! Storage::disk('local')->exists($path), 404, 'This file is not ready or no longer exists.');
 
-        return Storage::disk('local')->download($path, $job->downloadName($kind));
+        return Storage::disk('local')->download($this->resultPath($job, $kind === 'srt'), $job->downloadName($kind));
+    }
+
+    /**
+     * Send a finished result for the page's player: kind "video" (the MP4, with range requests so
+     * the player can seek) or "vtt" (the subtitles as WebVTT). Only for the user who uploaded it.
+     */
+    public function preview(Request $request, VideoJob $job, string $kind): BinaryFileResponse|HttpResponse
+    {
+        $this->authorizeOwner($request, $job);
+        $path = $this->resultPath($job, $kind === 'vtt');
+        $disk = Storage::disk('local');
+
+        return $kind === 'vtt'
+            ? response(VideoJob::srtToVtt($disk->get($path)), 200, ['Content-Type' => 'text/vtt; charset=UTF-8'])
+            : response()->file($disk->path($path), ['Content-Type' => 'video/mp4']);
     }
 
     /**
@@ -162,6 +180,17 @@ class VideoJobController extends Controller
     }
 
     /**
+     * The stored path of a job's subtitles or dubbed video. Answers 404 if it is not there.
+     */
+    private function resultPath(VideoJob $job, bool $subtitles): string
+    {
+        $path = $subtitles ? $job->srt_path : $job->video_path;
+        abort_if($path === null || ! Storage::disk('local')->exists($path), 404, 'This file is not ready or no longer exists.');
+
+        return $path;
+    }
+
+    /**
      * A clear sentence for a failed worker call.
      */
     private function workerError(Response $response): string
@@ -205,6 +234,8 @@ class VideoJobController extends Controller
             'review_url' => $job->status === VideoJob::REVIEW ? route('dub.review', $job) : null,
             'srt_url' => $job->srt_path ? route('dub.download', [$job, 'srt']) : null,
             'video_url' => $job->video_path ? route('dub.download', [$job, 'video']) : null,
+            'preview_url' => $job->video_path ? route('dub.preview', [$job, 'video']) : null,
+            'subtitles_url' => $job->video_path && $job->srt_path ? route('dub.preview', [$job, 'vtt']) : null,
         ];
     }
 }

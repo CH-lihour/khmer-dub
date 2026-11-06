@@ -140,10 +140,14 @@ How the voice is made and fitted:
 - `dubbed.mp4` copies the picture (`-c:v copy`) and adds the Khmer track as AAC, tagged as an
   AI-generated voice. MP4 cannot hold some WebM codecs (VP8, for example). Those videos are
   re-encoded to H.264 instead, which is slower.
-- The original sound plays under the Khmer voice at a fixed level, `ORIGINAL_VOLUME` in
-  `worker/.env` (default `0.15`, about 16 dB quieter; `0` leaves only the Khmer voice). Because the
-  level stays fixed, the original speech never gets loud between Khmer lines. After changing the
-  setting, run `docker compose up -d worker` so the worker reads `worker/.env` again.
+- The **Original sound** slider on the upload form sets how loud the original plays under the Khmer
+  voice for that video, from Off (only the Khmer voice) to 100%. It starts at Off. Music and
+  effects go up and down with the speech, because the original is one mixed track. 15% is about
+  16 dB quieter. Because the level stays fixed, the original speech never gets loud between Khmer
+  lines.
+- `ORIGINAL_VOLUME` in `worker/.env` is only the default for `POST /jobs` calls and scripts that
+  send no level (`try_pipeline.py`, say). After changing it, run `docker compose up -d worker` so
+  the worker reads `worker/.env` again.
 
 Segment times are fitted to the speech. Whisper's own times often start a line early (by up to
 2 s on the test clip) or let it run into the next one, so `stages/transcribe.py` does three things:
@@ -171,7 +175,7 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 
 | Call | Answer |
 | --- | --- |
-| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`) | `{"job_id": "<32 hex>"}` |
+| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`) | `{"job_id": "<32 hex>"}` |
 | `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language"}` |
 | `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` |
 | `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km"}]}`) | `{"status": "queued"}`; saves the Khmer and resumes the job |
@@ -187,7 +191,8 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
   the answer is 500.
 - `language` is the detected spoken language as a Whisper code (for example `en`), or `null`
   until the Khmer is ready. `error` is `null` unless something failed.
-- `gender` defaults to `female`, `dub` to `true` and `review` to `false` when they are left out.
+- `gender` defaults to `female`, `dub` to `true`, `review` to `false` and `original_volume` to
+  `ORIGINAL_VOLUME` when they are left out.
 - The review calls answer 409 for a job that is not in `review`, so saving twice cannot run it twice.
 - Jobs run one at a time on one worker thread, in upload order. Later uploads wait as `queued`.
 - Each job lives in `/data/jobs/<id>/` (the `worker_jobs` volume) with a `status.json`. After a
@@ -250,6 +255,11 @@ the key, and a text with no Khmer entry shows in English. A test fails if a page
    `storage/app/private/`, not `storage/app/`.
 3. The page reads `GET /dub/<id>/status` and offers `GET /dub/<id>/download/srt` and `/video`.
    The downloads are named after the upload, for example `my-talk-khmer.mp4`.
+4. When a job has a dubbed video, the page plays it in a player with the Khmer subtitles, which
+   you can turn off in the player. `GET /dub/<id>/preview/video` answers range requests so the
+   player can seek, and `/preview/vtt` turns the SRT into WebVTT, the only format browsers read.
+   A subtitles-only job has no player. If a browser cannot play the video's codec (MP4 keeps the
+   upload's codec), the page says so and the download still works.
 
 A failed job shows the reason: the worker's own message (no speech, too long, voice service
 unreachable, and so on), or a hint when the worker is down or the tokens differ. A job stops
@@ -330,7 +340,7 @@ Keep `post_max_size` a little above `upload_max_filesize`, and change the `max:5
 
 | Service  | Image                         | Role                              | Port |
 | -------- | ----------------------------- | --------------------------------- | ---- |
-| `web`    | `php:8.5.12-cli-trixie` + Composer 2.10 | `php artisan serve`   | 8000 |
+| `web`    | `php:8.5.12-cli-trixie` + Composer 2.10 | `php artisan serve` (4 PHP processes) | 8000 |
 | `queue`  | same as `web`                 | `php artisan queue:work --timeout=3700` | none |
 | `scheduler` | same as `web`              | `php artisan schedule:work` (daily `dub:cleanup`) | none |
 | `mysql`  | `mysql:9.7.4` (LTS)           | database                          | none |
@@ -397,8 +407,8 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - The worker runs one job at a time, so an upload can wait in the queue behind a long video.
   Restarting the worker fails the job that was running.
 - The page cannot show how far a large upload has got; it shows "Uploading" until the server has
-  the whole file. `php artisan serve` is a development server, and a slow upload can hold up the
-  page's other requests.
+  the whole file. `php artisan serve` is a development server with four PHP processes, and a slow
+  upload or a video open in the player holds one each. About four at once make the site wait.
 - The Khmer text of the site (`web/lang/km.json`) was written by AI and needs review by a Khmer
   speaker. Error messages from the worker stay in English, also on the Khmer pages.
 - The review page edits text only. It cannot change a line's timing, split or join lines, or play

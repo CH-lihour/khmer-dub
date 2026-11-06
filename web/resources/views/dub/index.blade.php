@@ -3,6 +3,7 @@
     $texts = [
         'uploading' => __('Uploading'),
         'review' => __('Review'),
+        'off' => __('Off'),
         'justNow' => __('just now'),
         'chooseFile' => __('Choose a video file.'),
         'signedOut' => __('You are signed out. Reload the page and log in again.'),
@@ -13,6 +14,7 @@
         'uploadFailed' => __('The upload failed (HTTP :status). Please try again.'),
         'unreachable' => __('The site could not be reached. Check that it is running and try again.'),
     ];
+    $originalVolume = (float) old('original_volume', 0);
 @endphp
 <x-app-layout>
     <section class="hero">
@@ -43,6 +45,11 @@
                     <input type="checkbox" name="dub" value="1" @checked(! $errors->any() || old('dub'))><i></i>
                     <span>{{ __('Dub the video') }}</span>
                 </label>
+                <div id="original-sound" class="level">
+                    <label for="original-volume">{{ __('Original sound') }}</label>
+                    <output id="original-level" for="original-volume">{{ $originalVolume > 0 ? round($originalVolume * 100).'%' : __('Off') }}</output>
+                    <input id="original-volume" type="range" name="original_volume" min="0" max="1" step="0.05" value="{{ $originalVolume }}">
+                </div>
                 <label class="toggle">
                     <input type="checkbox" name="review" value="1" @checked(old('review'))><i></i>
                     <span>{{ __('Edit the Khmer first') }}</span>
@@ -67,6 +74,10 @@
             <p id="job-message" class="job-message">{{ $current['message'] ?? '' }}</p>
             <p id="job-error" class="error" @if (empty($current['error'])) hidden @endif>{{ $current['error'] ?? '' }}</p>
             <p id="job-language" class="hint" @if (empty($current['language_name'])) hidden @endif><b>{{ $current['language_name'] ?? '' }}</b></p>
+            <video id="job-player" class="player" controls playsinline preload="metadata" hidden>
+                <track id="job-subtitles" kind="subtitles" srclang="km" label="{{ __('Khmer') }}" default>
+            </video>
+            <p id="job-player-error" class="error" hidden>{{ __('This browser cannot play the video. Download it instead.') }}</p>
             <div class="links">
                 <a id="job-review" class="button sun" href="{{ $current['review_url'] ?? '#' }}" @if (empty($current['review_url'])) hidden @endif>{{ __('Check the Khmer') }}</a>
                 <a id="job-video" class="button" href="{{ $current['video_url'] ?? '#' }}" @if (empty($current['video_url'])) hidden @endif>↓ {{ __('Video') }}</a>
@@ -111,6 +122,7 @@
         const POLL_MS = 3000;
         const $ = (id) => document.getElementById(id);
         const form = $('upload'), start = $('start'), errors = $('errors'), video = $('video'), drop = $('drop');
+        const level = $('original-volume'), dub = form.elements.dub;
         let timer = null;
 
         function showErrors(list) {
@@ -122,6 +134,30 @@
             const file = video.files[0];
             $('drop-name').textContent = file ? file.name : '';
             drop.classList.toggle('chosen', Boolean(file));
+        }
+
+        /** Show the original sound level; the slider only applies when there is a voice to play over it. */
+        function showLevel() {
+            const percent = Math.round(level.value * 100);
+            const text = percent ? `${percent}%` : TEXT.off;
+            $('original-level').textContent = text;
+            level.setAttribute('aria-valuetext', text);
+            level.disabled = !dub.checked;
+            $('original-sound').hidden = !dub.checked;
+        }
+
+        /** Load the job's dubbed video into the player, or empty and hide the player if it has none. */
+        function showPlayer(job) {
+            const player = $('job-player'), url = job.preview_url || '';
+            if ((player.dataset.url || '') === url) return; // polling must not restart a playing video
+            player.dataset.url = url;
+            player.pause();
+            player.hidden = !url;
+            $('job-player-error').hidden = true;
+            $('job-subtitles').src = job.subtitles_url || '';
+            if (url) player.src = url;
+            else player.removeAttribute('src');
+            player.load();
         }
 
         /** Draw a job (the JSON from the status route) in the progress card and in its history row. */
@@ -139,6 +175,7 @@
             $('job-error').textContent = job.error || '';
             $('job-language').hidden = !job.language_name;
             $('job-language').querySelector('b').textContent = job.language_name || '';
+            showPlayer(job);
             for (const [id, url] of [['job-review', job.review_url], ['job-srt', job.srt_url], ['job-video', job.video_url]]) {
                 $(id).hidden = !url;
                 $(id).href = url || '#';
@@ -191,6 +228,14 @@
         }
 
         video.addEventListener('change', showFile);
+        $('job-player').addEventListener('error', (event) => {
+            if (!event.target.dataset.url) return; // emptying the player is not a failure
+            event.target.hidden = true;
+            $('job-player-error').hidden = false;
+        });
+        level.addEventListener('input', showLevel);
+        dub.addEventListener('change', showLevel);
+        showLevel();
         for (const name of ['dragenter', 'dragover']) drop.addEventListener(name, () => drop.classList.add('over'));
         for (const name of ['dragleave', 'drop']) drop.addEventListener(name, () => drop.classList.remove('over'));
 
@@ -209,6 +254,7 @@
                     history.replaceState(null, '', `?job=${id}`);
                     form.reset();
                     showFile();
+                    showLevel();
                     poll(url);
                     return;
                 }

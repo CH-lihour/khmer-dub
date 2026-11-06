@@ -135,6 +135,18 @@ def test_merge_without_the_original_sound(tone_video: Path, tmp_path: Path, monk
     assert loudness(merged_sound(out, tmp_path), 0.5, 1.5) < 1
 
 
+def test_merge_level_of_a_job_wins_over_the_setting(tone_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "ORIGINAL_VOLUME", 0.15)
+    original = merged_sound(tone_video, tmp_path)
+    dub = silence(tmp_path / "dub.wav", 2.0)
+
+    half = merged_sound(merge(tone_video, dub, tmp_path / "half.mp4", 0.5), tmp_path)
+    off = merged_sound(merge(tone_video, dub, tmp_path / "off.mp4", 0), tmp_path)
+
+    assert loudness(half, 0.5, 1.5) / loudness(original, 0.5, 1.5) == pytest.approx(0.5, abs=0.03)
+    assert loudness(off, 0.5, 1.5) < 1
+
+
 def test_merge_of_a_video_without_sound_uses_only_the_voice(silent_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "ORIGINAL_VOLUME", 0.15)
     out = merge(silent_video, tone(tmp_path / "dub.wav", 1.0), tmp_path / "dubbed.mp4")

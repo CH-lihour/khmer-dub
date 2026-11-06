@@ -120,6 +120,7 @@ class ProcessVideoJob implements ShouldQueue
                 ->attach('file', $stream, basename($job->path)) // the random stored name keeps the extension
                 ->post('/jobs', [
                     'gender' => $job->gender, 'dub' => $job->dub ? 'true' : 'false', 'review' => $job->review ? 'true' : 'false',
+                    'original_volume' => (string) $job->original_volume,
                 ]);
         } finally {
             if (is_resource($stream)) {

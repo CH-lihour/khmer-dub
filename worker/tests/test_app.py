@@ -40,8 +40,9 @@ def runs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     """Replace pipeline.run with a fake that reports every milestone and writes the result files."""
     calls: list[dict] = []
 
-    def run(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress) -> dict:
-        calls.append({"video": Path(video_path), "exists": Path(video_path).is_file(), "gender": gender, "dub": dub})
+    def run(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
+        calls.append({"video": Path(video_path), "exists": Path(video_path).is_file(), "gender": gender, "dub": dub,
+                      "original_volume": original_volume})
         for percent, message in [(5, "Extracting audio"), (15, "Transcribing speech"), (45, "Translating to Khmer")]:
             progress(percent, message)
         srt = Path(job_dir) / "khmer.srt"
@@ -121,7 +122,8 @@ def test_dub_job_end_to_end(client: TestClient, runs: list[dict], work_dir: Path
     assert re.fullmatch(r"[0-9a-f]{32}", job_id)
 
     assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en"}
-    assert runs == [{"video": work_dir / job_id / "input.mp4", "exists": True, "gender": "male", "dub": True}]
+    assert runs == [{"video": work_dir / job_id / "input.mp4", "exists": True, "gender": "male", "dub": True,
+                     "original_volume": None}]
 
     srt = client.get(f"/jobs/{job_id}/download/srt", headers=AUTH)
     assert srt.status_code == 200
@@ -156,6 +158,11 @@ def test_defaults_are_female_and_dub(client: TestClient, runs: list[dict], tone_
     assert (runs[0]["gender"], runs[0]["dub"]) == ("female", True)
 
 
+def test_original_volume_reaches_the_pipeline(client: TestClient, runs: list[dict], tone_video: Path) -> None:
+    wait(client, upload(client, tone_video, original_volume="0.35").json()["job_id"])
+    assert runs[0]["original_volume"] == 0.35
+
+
 def test_unknown_job_is_404(client: TestClient) -> None:
     for path in ["", "/download/srt", "/download/video"]:
         response = client.get(f"/jobs/{'f' * 32}{path}", headers=AUTH)
@@ -170,6 +177,9 @@ def test_unknown_job_is_404(client: TestClient) -> None:
         ("clip", {}, "Unsupported file type 'none'"),
         ("clip.mp4", {"gender": "robot"}, "gender must be female or male"),
         ("clip.mp4", {"dub": "maybe"}, "dub must be true or false"),
+        ("clip.mp4", {"original_volume": "1.5"}, "original_volume"),
+        ("clip.mp4", {"original_volume": "-0.1"}, "original_volume"),
+        ("clip.mp4", {"original_volume": "loud"}, "original_volume"),
     ],
 )
 def test_bad_fields_are_422(client: TestClient, work_dir: Path, tone_video: Path, name: str, fields: dict, detail: str) -> None:
@@ -213,7 +223,7 @@ def test_ffmpeg_missing_is_a_worker_fault(client: TestClient, tone_video: Path, 
 
 
 def test_stage_error_fails_the_job(client: TestClient, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_speech(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress) -> dict:
+    def no_speech(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
         progress(5, "Extracting audio")
         progress(15, "Transcribing speech")
         raise StageError("No speech was found in the video.")
@@ -230,7 +240,7 @@ def test_stage_error_fails_the_job(client: TestClient, tone_video: Path, monkeyp
 
 
 def test_crash_fails_the_job_without_details(client: TestClient, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def crash(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress) -> dict:
+    def crash(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
         raise RuntimeError("secret traceback detail")
 
     monkeypatch.setattr(pipeline, "run", crash)
@@ -243,7 +253,7 @@ def test_crash_fails_the_job_without_details(client: TestClient, tone_video: Pat
 def test_jobs_run_one_at_a_time(client: TestClient, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     release, started = threading.Event(), []
 
-    def slow(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress) -> dict:
+    def slow(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
         started.append(Path(job_dir).name)
         progress(45, "Translating to Khmer")
         release.wait(10)
@@ -308,7 +318,7 @@ def test_cleanup_deletes_only_old_finished_jobs(
     jobs.update(old_done, created=days_ago(8))
     jobs.update(old_running, status="processing", created=days_ago(8))  # as if it were still running
 
-    def no_speech(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress) -> dict:
+    def no_speech(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None) -> dict:
         raise StageError("No speech was found in the video.")
 
     monkeypatch.setattr(pipeline, "run", no_speech)
@@ -368,10 +378,11 @@ def finished(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         pipeline.save_segments(job_dir, [dict(seg) for seg in LINES])
         return {"language": "en", "duration": 60.0}
 
-    def finish(job_dir: Path, video_path: Path, gender: str, dub: bool, duration: float, progress: Progress) -> dict:
+    def finish(job_dir: Path, video_path: Path, gender: str, dub: bool, duration: float, progress: Progress,
+               original_volume: float | None = None) -> dict:
         segments = pipeline.load_segments(job_dir)
         calls.append({"km": [seg["km"] for seg in segments], "gender": gender, "dub": dub, "duration": duration,
-                      "upload_kept": Path(video_path).is_file()})
+                      "original_volume": original_volume, "upload_kept": Path(video_path).is_file()})
         progress(100, "Done")
         srt = Path(job_dir) / "khmer.srt"
         srt.write_text("\n".join(seg["km"] for seg in segments), encoding="utf-8")
@@ -419,6 +430,15 @@ def test_review_job_stops_after_translation_and_shows_its_lines(client: TestClie
     assert client.get(f"/jobs/{job_id}/download/srt", headers=AUTH).status_code == 404
 
 
+def test_original_volume_is_kept_through_the_review(client: TestClient, finished: list, tone_video: Path) -> None:
+    job_id = in_review(client, tone_video, original_volume="0.5")
+
+    assert edit(client, job_id, (1, "ជម្រាបលា")).status_code == 200
+
+    wait(client, job_id)
+    assert finished[0]["original_volume"] == 0.5
+
+
 def test_saved_edits_reach_the_results(client: TestClient, finished: list, work_dir: Path, tone_video: Path) -> None:
     job_id = in_review(client, tone_video, gender="male", dub="false")
 
@@ -426,7 +446,8 @@ def test_saved_edits_reach_the_results(client: TestClient, finished: list, work_
 
     assert response.status_code == 200
     assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en"}
-    assert finished == [{"km": ["សួស្តី", "ជម្រាបលា"], "gender": "male", "dub": False, "duration": 60.0, "upload_kept": True}]
+    assert finished == [{"km": ["សួស្តី", "ជម្រាបលា"], "gender": "male", "dub": False, "duration": 60.0,
+                         "original_volume": None, "upload_kept": True}]
     assert client.get(f"/jobs/{job_id}/download/srt", headers=AUTH).content.decode("utf-8") == "សួស្តី\nជម្រាបលា"
     assert not (work_dir / job_id / "input.mp4").exists(), "the upload is tidied away once the job is done"
 
@@ -516,7 +537,8 @@ def test_failed_voice_keeps_the_edits_and_can_be_retried(
     job_id = in_review(client, tone_video)
     working_finish = pipeline.finish
 
-    def voice_down(job_dir: Path, video_path: Path, gender: str, dub: bool, duration: float, progress: Progress) -> dict:
+    def voice_down(job_dir: Path, video_path: Path, gender: str, dub: bool, duration: float, progress: Progress,
+               original_volume: float | None = None) -> dict:
         raise StageError("The Khmer voice service (edge-tts) could not be reached.")
 
     monkeypatch.setattr(pipeline, "finish", voice_down)

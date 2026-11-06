@@ -11,9 +11,13 @@ services:
     build: *web-build
     image: khmer-dub-web:dev
     env_file: ./web/.env
+    # Four PHP processes, so a video playing or paused in the page's player does not hold up the site.
+    # PHP_CLI_SERVER_WORKERS only works with --no-reload: after changing web/.env, restart web.
+    command: ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8000", "--no-reload"]
     environment:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
+      PHP_CLI_SERVER_WORKERS: "4"
     volumes:
       - ./web:/var/www/html
     ports:

@@ -20,16 +20,18 @@ log = logging.getLogger(__name__)
 Progress = Callable[[int, str], None]
 
 
-def run(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, progress: Progress) -> dict:
+def run(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, progress: Progress,
+        original_volume: float | None = None) -> dict:
     """Process one video inside `job_dir` and return {"language", "segments", "srt", "video"}.
 
     Reports the API contract's milestones through `progress(percent, message)`: 5 extract audio,
     15 transcribe, 45 translate, 60 voice, 85 mix and merge, 100 done. With dub=False it stops
-    after the SRT and "video" is None. `gender` ("female" or "male") picks the Khmer voice. Stage
-    failures raise StageError with a message the user can act on.
+    after the SRT and "video" is None. `gender` ("female" or "male") picks the Khmer voice, and
+    `original_volume` (0 to 1) how loud the original sound plays under it; None uses
+    ORIGINAL_VOLUME. Stage failures raise StageError with a message the user can act on.
     """
     prepared = prepare(job_dir, video_path, progress)
-    finished = finish(job_dir, video_path, gender, dub, prepared["duration"], progress)
+    finished = finish(job_dir, video_path, gender, dub, prepared["duration"], progress, original_volume)
     return {"language": prepared["language"], **finished}
 
 
@@ -55,7 +57,7 @@ def prepare(job_dir: str | Path, video_path: str | Path, progress: Progress) -> 
 
 
 def finish(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, duration: float,
-           progress: Progress) -> dict:
+           progress: Progress, original_volume: float | None = None) -> dict:
     """Turn the saved segments.json into the results and return {"segments", "srt", "video"}.
 
     An empty Khmer line gets no subtitle and no voice. With dub=False it stops after the SRT and
@@ -72,7 +74,7 @@ def finish(job_dir: str | Path, video_path: str | Path, gender: str, dub: bool, 
         synth_all(segments, job_dir / "clips", gender)
         progress(85, "Mixing and merging")
         dub_wav = build_track(segments, round(duration * 1000), job_dir)
-        video = merge(video_path, dub_wav, job_dir / "dubbed.mp4")
+        video = merge(video_path, dub_wav, job_dir / "dubbed.mp4", original_volume)
 
     # Kept for debugging and review: each segment's times, original and Khmer text, and voice timing.
     save_segments(job_dir, segments)

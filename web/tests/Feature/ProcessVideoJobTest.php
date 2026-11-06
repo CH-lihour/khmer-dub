@@ -42,7 +42,7 @@ class ProcessVideoJobTest extends TestCase
     {
         Storage::disk('local')->put('uploads/abc123.webm', 'video bytes');
 
-        return VideoJob::create(['original_name' => 'talk.webm', 'path' => 'uploads/abc123.webm', 'gender' => 'male', ...$attributes]);
+        return VideoJob::create(['original_name' => 'talk.webm', 'path' => 'uploads/abc123.webm', 'gender' => 'male', 'original_volume' => 0.35, ...$attributes]);
     }
 
     /**
@@ -113,7 +113,7 @@ class ProcessVideoJobTest extends TestCase
             return $request->url() === 'http://worker.test/jobs' && $request->method() === 'POST'
                 && $request->hasHeader('x-token', 'test-token') && $request->isMultipart()
                 && $request->hasFile('file', null, 'abc123.webm')
-                && $fields['gender'] === 'male' && $fields['dub'] === 'true';
+                && $fields['gender'] === 'male' && $fields['dub'] === 'true' && $fields['original_volume'] === '0.35';
         });
         Http::assertSent(fn (Request $request) => $request->url() === 'http://worker.test/jobs/w1' && $request->hasHeader('x-token', 'test-token'));
     }

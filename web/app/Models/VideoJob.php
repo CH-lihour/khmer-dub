@@ -18,6 +18,7 @@ use Locale;
  * @property string $gender
  * @property bool $dub
  * @property bool $review
+ * @property float $original_volume
  * @property string $status
  * @property int $progress
  * @property string|null $message
@@ -42,8 +43,8 @@ class VideoJob extends Model
 
     /** @var list<string> */
     protected $fillable = [
-        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'status', 'progress', 'message',
-        'language', 'worker_job_id', 'srt_path', 'video_path', 'error',
+        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'original_volume', 'status', 'progress',
+        'message', 'language', 'worker_job_id', 'srt_path', 'video_path', 'error',
     ];
 
     /** @var array<string, mixed> */
@@ -51,6 +52,7 @@ class VideoJob extends Model
         'gender' => 'female',
         'dub' => true,
         'review' => false,
+        'original_volume' => 0,
         'status' => self::QUEUED,
         'progress' => 0,
     ];
@@ -60,7 +62,7 @@ class VideoJob extends Model
      */
     protected function casts(): array
     {
-        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'progress' => 'integer'];
+        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'progress' => 'integer'];
     }
 
     /**
@@ -118,6 +120,16 @@ class VideoJob extends Model
         $name = Locale::getDisplayLanguage($this->language, app()->getLocale());
 
         return $name !== '' && $name !== $this->language ? $name : $this->language;
+    }
+
+    /**
+     * Turn SRT subtitles into WebVTT, the only format the browser's video player reads.
+     */
+    public static function srtToVtt(string $srt): string
+    {
+        $times = '/^(\d{2}:\d{2}:\d{2}),(\d{3}) --> (\d{2}:\d{2}:\d{2}),(\d{3})$/m';
+
+        return "WEBVTT\n\n".preg_replace($times, '$1.$2 --> $3.$4', $srt);
     }
 
     /**

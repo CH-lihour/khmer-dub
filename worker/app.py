@@ -1,6 +1,6 @@
 """HTTP endpoints of the dubbing worker, exactly as in the API contract of CLAUDE.md.
 
-    POST /jobs                       multipart file, gender, dub, review -> {"job_id": "<hex>"}
+    POST /jobs                       multipart file, gender, dub, review, original_volume -> {"job_id": "<hex>"}
     GET  /jobs/{id}                  -> {"status", "progress", "message", "error", "language"}
     GET  /jobs/{id}/segments         -> {"segments": [...]}, while the job waits for review
     PUT  /jobs/{id}/segments         JSON {"segments": [{"id", "km"}]} -> saves the Khmer and resumes
@@ -87,11 +87,12 @@ class JobStore:
         folder.mkdir(parents=True)
         return job_id, folder
 
-    def submit(self, job_id: str, upload: str, gender: str, dub: bool, review: bool = False) -> None:
+    def submit(self, job_id: str, upload: str, gender: str, dub: bool, review: bool = False,
+               original_volume: float | None = None) -> None:
         """Record a new job as queued and put it in line for the worker thread."""
         job = {"status": "queued", "progress": 0, "message": "Waiting in the queue", "error": None,
                "language": None, "upload": upload, "gender": gender, "dub": dub, "review": review,
-               "created": _now()}
+               "original_volume": original_volume, "created": _now()}
         with self._lock:
             self._jobs[job_id] = job
         self.update(job_id)
@@ -175,7 +176,7 @@ class JobStore:
                 prepared = pipeline.prepare(folder, video, progress)
                 self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, **prepared)
             else:
-                result = pipeline.run(folder, video, job["gender"], job["dub"], progress)
+                result = pipeline.run(folder, video, job["gender"], job["dub"], progress, job.get("original_volume"))
                 self._done(job_id, job["upload"], result)
 
         self._attempt(job_id, work)
@@ -186,7 +187,7 @@ class JobStore:
 
         def work() -> None:
             result = pipeline.finish(folder, folder / job["upload"], job["gender"], job["dub"], job["duration"],
-                                     self._reporter(job_id))
+                                     self._reporter(job_id), job.get("original_volume"))  # .get: older status.json
             self._done(job_id, job["upload"], {**result, "language": job["language"]})
 
         # A failure here (the voice service being down, say) must not lose the reviewer's work:
@@ -287,12 +288,14 @@ def create_job(
     gender: Annotated[str, Form()] = "female",
     dub: Annotated[str, Form()] = "true",
     review: Annotated[str, Form()] = "false",
+    original_volume: Annotated[float | None, Form(ge=0, le=1)] = None,
 ) -> dict[str, str]:
     """Save the uploaded video, check it, queue it, and return {"job_id": "<hex>"}.
 
     `gender` is female or male (default female), `dub` is true or false (default true), and
     `review` is true to stop after translation so a person can edit the Khmer (default false).
-    Answers 422 with a clear `detail` for a missing file, an unsupported or unreadable format, a
+    `original_volume` is how loud the original sound plays under the voice, 0 to 1 (default
+    ORIGINAL_VOLUME). Answers 422 with a clear `detail` for a missing file, an unsupported or unreadable format, a
     video without sound or one longer than MAX_VIDEO_MINUTES.
     """
     gender, dub, review = gender.strip().lower(), dub.strip().lower(), review.strip().lower()
@@ -324,7 +327,7 @@ def create_job(
         raise HTTPException(500, "The worker could not save the video. Check its free disk space.") from exc
 
     log.info("Job %s queued: %s, %.1f MB", job_id, extension, upload.stat().st_size / 1e6)
-    jobs.submit(job_id, upload.name, gender, DUB_VALUES[dub], DUB_VALUES[review])  # it may delete the upload from here on
+    jobs.submit(job_id, upload.name, gender, DUB_VALUES[dub], DUB_VALUES[review], original_volume)  # it may delete the upload from here on
     return {"job_id": job_id}
 
 

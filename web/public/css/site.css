@@ -156,6 +156,12 @@ html[lang=km] h1, html[lang=km] h2 { line-height: 1.5; letter-spacing: 0; }
 .toggle input:checked + i { background: var(--jade); }
 .toggle input:checked + i::after { transform: translateX(1.15rem); }
 .toggle input:focus-visible + i { outline: 3px solid var(--lotus); outline-offset: 2px; }
+
+.level { display: grid; grid-template-columns: 1fr auto; gap: .2rem .75rem; align-items: center; margin: 0 0 .75rem; }
+.level label { margin: 0; font-weight: 600; }
+.level output { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.level input { grid-column: 1 / -1; width: 100%; margin: 0; padding: 0; border: 0; background: none; accent-color: var(--jade); cursor: pointer; }
+.level input:focus-visible { outline: 3px solid var(--lotus); outline-offset: 2px; }
 .upload button[type=submit] { width: 100%; margin-top: .25rem; font-size: 1.05rem; }
 
 /* The job being followed: the cloth grows as the work goes on */
@@ -173,6 +179,8 @@ html[lang=km] h1, html[lang=km] h2 { line-height: 1.5; letter-spacing: 0; }
 @keyframes weave { to { background-position: 24px 0; } }
 .job-message { font-weight: 600; margin: 0; }
 .job .error { color: var(--lotus); font-weight: 600; margin: .5rem 0 0; }
+.player { display: block; width: 100%; max-height: 70vh; margin-top: 1rem; border-radius: 12px; background: #000000; }
+.player::cue { font-family: "Kantumruy Pro", "Khmer UI", "Noto Sans Khmer", sans-serif; }
 .links { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
 .links:not(:has(a:not([hidden]))) { display: none; }
 

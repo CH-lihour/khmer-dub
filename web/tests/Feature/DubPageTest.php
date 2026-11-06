@@ -65,6 +65,7 @@ class DubPageTest extends TestCase
         $this->get('/dub')->assertOk()
             ->assertSee('Khmer Dub')->assertSee('Give your video a Khmer voice')->assertSee($this->user->name)
             ->assertSee('name="video"', false)->assertSee('name="gender"', false)->assertSee('name="dub"', false)
+            ->assertSee('name="original_volume"', false)->assertSee('Original sound')
             ->assertSee('old talk.mp4')
             ->assertSee(route('dub.download', [$job, 'srt']));
     }
@@ -102,6 +103,7 @@ class DubPageTest extends TestCase
             'video' => UploadedFile::fake()->create('My Holiday.mp4', 1000, 'video/mp4'),
             'gender' => 'male',
             'dub' => '1',
+            'original_volume' => '0.35',
         ], self::JSON);
 
         $job = VideoJob::sole();
@@ -111,6 +113,7 @@ class DubPageTest extends TestCase
         $this->assertMatchesRegularExpression('#^uploads/[A-Za-z0-9]{40}\.mp4$#', $job->path);
         Storage::disk('local')->assertExists($job->path);
         $this->assertSame(['male', true, 'queued', 0, 'Waiting in the queue'], [$job->gender, $job->dub, $job->status, $job->progress, $job->message]);
+        $this->assertSame(0.35, $job->original_volume);
         Queue::assertPushed(ProcessVideoJob::class, fn (ProcessVideoJob $pushed) => $pushed->videoJob->is($job));
     }
 
@@ -119,7 +122,7 @@ class DubPageTest extends TestCase
         $this->post('/dub', ['video' => UploadedFile::fake()->create('a.webm', 10, 'video/webm')], self::JSON)->assertCreated();
 
         $job = VideoJob::sole();
-        $this->assertSame(['female', false], [$job->gender, $job->dub]);
+        $this->assertSame(['female', false, 0.0], [$job->gender, $job->dub, $job->original_volume]);
         $this->assertStringEndsWith('.webm', $job->path);
     }
 
@@ -140,6 +143,8 @@ class DubPageTest extends TestCase
             'too big' => [['video' => UploadedFile::fake()->create('big.mp4', 512001, 'video/mp4')], 'video', 'larger than 500 MB'],
             'unknown voice' => [['video' => UploadedFile::fake()->create('a.mp4', 1, 'video/mp4'), 'gender' => 'robot'], 'gender', 'female or the male voice'],
             'dub not boolean' => [['video' => UploadedFile::fake()->create('a.mp4', 1, 'video/mp4'), 'dub' => 'maybe'], 'dub', 'true or false'],
+            'original sound too loud' => [['video' => UploadedFile::fake()->create('a.mp4', 1, 'video/mp4'), 'original_volume' => '1.5'], 'original_volume', '0 to 100%'],
+            'original sound not a number' => [['video' => UploadedFile::fake()->create('a.mp4', 1, 'video/mp4'), 'original_volume' => 'loud'], 'original_volume', '0 to 100%'],
         ];
     }
 
@@ -164,6 +169,7 @@ class DubPageTest extends TestCase
             'id' => $job->id, 'name' => 'talk.mp4', 'status' => 'processing', 'progress' => 45,
             'message' => 'Translating to Khmer', 'error' => null, 'language' => null, 'language_name' => null,
             'dub' => true, 'status_url' => route('dub.status', $job), 'review_url' => null, 'srt_url' => null, 'video_url' => null,
+            'preview_url' => null, 'subtitles_url' => null,
         ]);
     }
 
@@ -174,7 +180,57 @@ class DubPageTest extends TestCase
         $this->getJson(route('dub.status', $job))->assertOk()->assertJson([
             'status' => 'done', 'language' => 'en', 'language_name' => 'English',
             'srt_url' => route('dub.download', [$job, 'srt']), 'video_url' => route('dub.download', [$job, 'video']),
+            'preview_url' => route('dub.preview', [$job, 'video']), 'subtitles_url' => route('dub.preview', [$job, 'vtt']),
         ]);
+    }
+
+    public function test_a_subtitles_only_job_has_nothing_to_preview(): void
+    {
+        $job = $this->makeJob(['status' => 'done', 'dub' => false, 'srt_path' => 'results/1/khmer.srt']);
+
+        $this->getJson(route('dub.status', $job))->assertOk()->assertJson(['preview_url' => null, 'subtitles_url' => null]);
+    }
+
+    public function test_the_player_can_seek_in_the_dubbed_video(): void
+    {
+        Storage::disk('local')->put('results/1/dubbed.mp4', 'fake mp4 bytes');
+        $job = $this->makeJob(['status' => 'done', 'video_path' => 'results/1/dubbed.mp4']);
+
+        $whole = $this->get(route('dub.preview', [$job, 'video']))->assertOk()->assertHeader('Content-Type', 'video/mp4')
+            ->assertHeader('Accept-Ranges', 'bytes');
+        $this->assertStringNotContainsString('attachment', (string) $whole->headers->get('Content-Disposition'));
+
+        $this->get(route('dub.preview', [$job, 'video']), ['Range' => 'bytes=5-7'])->assertStatus(206)
+            ->assertHeader('Content-Range', 'bytes 5-7/14')->assertHeader('Content-Length', '3');
+    }
+
+    public function test_the_player_gets_the_subtitles_as_webvtt(): void
+    {
+        Storage::disk('local')->put('results/1/khmer.srt', "1\n00:00:01,200 --> 00:00:04,800\nសួស្តី 12,500\n\n2\n01:02:03,000 --> 01:02:04,500\nលា\n");
+        $job = $this->makeJob(['status' => 'done', 'srt_path' => 'results/1/khmer.srt']);
+
+        $response = $this->get(route('dub.preview', [$job, 'vtt']))->assertOk()->assertHeader('Content-Type', 'text/vtt; charset=UTF-8');
+
+        $this->assertSame(
+            "WEBVTT\n\n1\n00:00:01.200 --> 00:00:04.800\nសួស្តី 12,500\n\n2\n01:02:03.000 --> 01:02:04.500\nលា\n",
+            $response->getContent(),
+        );
+    }
+
+    public function test_previews_are_only_for_the_owner_and_only_when_ready(): void
+    {
+        Storage::disk('local')->put('results/1/dubbed.mp4', 'fake mp4 bytes');
+        $other = $this->makeJob(['video_path' => 'results/1/dubbed.mp4', 'srt_path' => 'results/1/khmer.srt'], User::factory()->create());
+        $this->get(route('dub.preview', [$other, 'video']))->assertForbidden();
+        $this->get(route('dub.preview', [$other, 'vtt']))->assertForbidden();
+
+        $missing = $this->makeJob(['video_path' => 'results/2/dubbed.mp4']); // the row says so, but the file is gone
+        $this->get(route('dub.preview', [$missing, 'video']))->assertNotFound();
+        $this->get(route('dub.preview', [$missing, 'vtt']))->assertNotFound();
+        $this->get("/dub/{$missing->id}/preview/audio")->assertNotFound();
+
+        auth()->logout();
+        $this->get(route('dub.preview', [$other, 'video']))->assertRedirect(route('login'));
     }
 
     public function test_downloads_send_the_results_with_a_readable_name(): void

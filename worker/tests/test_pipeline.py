@@ -68,17 +68,17 @@ def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.Mon
         fake_stages.append(f"track:{total_ms}")
         return folder / "dub.wav"
 
-    def merge(video: Path, dub_wav: Path, out: Path) -> Path:
-        fake_stages.append(f"merge:{Path(dub_wav).name}")
+    def merge(video: Path, dub_wav: Path, out: Path, original_volume: float | None = None) -> Path:
+        fake_stages.append(f"merge:{Path(dub_wav).name}:{original_volume}")
         return out
 
     monkeypatch.setattr(pipeline, "synth_all", synth_all)
     monkeypatch.setattr(pipeline, "build_track", build_track)
     monkeypatch.setattr(pipeline, "merge", merge)
     milestones: list[int] = []
-    result = pipeline.run(tmp_path / "job", "in.mp4", "male", True, lambda p, m: milestones.append(p))
+    result = pipeline.run(tmp_path / "job", "in.mp4", "male", True, lambda p, m: milestones.append(p), 0.4)
 
-    assert fake_stages == ["audio", "transcribe", "translate:en", "voice:male", "track:60000", "merge:dub.wav"]
+    assert fake_stages == ["audio", "transcribe", "translate:en", "voice:male", "track:60000", "merge:dub.wav:0.4"]
     assert milestones == [5, 15, 45, 60, 85, 100]
     assert result["video"] == tmp_path / "job" / "dubbed.mp4"
     assert result["srt"].exists()
@@ -95,7 +95,7 @@ def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voic
 
     monkeypatch.setattr(pipeline, "synth_all", synth_all)
     monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
-    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out: out)
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
     job = tmp_path / "job"
     milestones: list[int] = []
 

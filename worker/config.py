@@ -12,4 +12,4 @@ WHISPER_DEVICE: str = os.environ.get("WHISPER_DEVICE", "cpu")
 TTS_ENGINE: str = os.environ.get("TTS_ENGINE", "edge")
 WORK_DIR: Path = Path(os.environ.get("WORK_DIR", "/data/jobs"))
 MAX_VIDEO_MINUTES: float = float(os.environ.get("MAX_VIDEO_MINUTES", "15"))
-ORIGINAL_VOLUME: float = float(os.environ.get("ORIGINAL_VOLUME", "0.15"))  # original sound under the voice; 0 = none
+ORIGINAL_VOLUME: float = float(os.environ.get("ORIGINAL_VOLUME", "0.15"))  # default for jobs sent without original_volume; 0 = none

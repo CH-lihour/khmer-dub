@@ -47,7 +47,7 @@ WHISPER_DEVICE=cpu        # cuda if an NVIDIA GPU exists
 TTS_ENGINE=edge           # edge | mms
 WORK_DIR=/data/jobs
 MAX_VIDEO_MINUTES=15
-ORIGINAL_VOLUME=0.15      # original sound under the voice, 0 to 1; 0 = Khmer voice only
+ORIGINAL_VOLUME=0.15      # default for POST /jobs without original_volume, 0 to 1; the site always sends it
 ```
 
 **Laravel `.env` additions**
@@ -122,7 +122,7 @@ Everything runs in containers. The developer needs only Git and Docker (Docker E
 
 | Service | Base image | Role | Published port |
 | --- | --- | --- | --- |
-| `web` | PHP 8.5 CLI with Composer, built from `web/Dockerfile` | Laravel site (`php artisan serve --host=0.0.0.0`) | 8000 |
+| `web` | PHP 8.5 CLI with Composer, built from `web/Dockerfile` | Laravel site (`php artisan serve --host=0.0.0.0 --no-reload` with `PHP_CLI_SERVER_WORKERS=4`, so the video player does not hold up the site) | 8000 |
 | `queue` | same image as `web` | `php artisan queue:work --timeout=3700` | none |
 | `scheduler` | same image as `web` | `php artisan schedule:work` (runs `dub:cleanup` daily) | none |
 | `mysql` | official `mysql` image, latest LTS tag | database | none |
@@ -162,7 +162,7 @@ Both apps must follow this contract exactly. Every request to the worker carries
 
 | Method and path | Sends | Returns |
 | --- | --- | --- |
-| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`) | `{"job_id": "<hex>"}` |
+| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`), `original_volume` (0 to 1, how loud the original sound plays under the Khmer voice; 0 = off, default `ORIGINAL_VOLUME`) | `{"job_id": "<hex>"}` |
 | `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language"}` |
 | `GET /jobs/{id}/segments` | nothing | `{"segments": [{"id", "start", "end", "text", "km"}]}` while the job waits for review |
 | `PUT /jobs/{id}/segments` | JSON: `{"segments": [{"id", "km"}]}` | `{"status": "queued"}` after saving the Khmer and resuming the job; lines left out keep their text, and an empty line is dropped |
@@ -217,7 +217,7 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 
 - `build_track(segments, total_ms, folder)` makes a silent track the length of the video and overlays each clip at its `start` time.
 - Only speed clips up, never slow them. Use FFmpeg `atempo` with a maximum factor of 1.6 (`MAX_SPEED`). Allow a clip to run into the silence after its slot, but never past the next segment's start. Speed it up only when it does not fit before the next segment.
-- `merge(video, dub_wav, out)` uses `-c:v copy` and AAC audio, so the video is not re-encoded. The original sound plays under the Khmer voice at a fixed `ORIGINAL_VOLUME`.
+- `merge(video, dub_wav, out)` uses `-c:v copy` and AAC audio, so the video is not re-encoded. The original sound plays under the Khmer voice at the job's `original_volume`, fixed for the whole video.
 - `write_srt(segments, path)` writes UTF-8 SRT with the Khmer text and the original timestamps.
 
 **`pipeline.py`**
@@ -244,6 +244,7 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `gender` | string | `male` or `female`, default `female` |
 | `dub` | boolean | default true |
 | `review` | boolean | default false; stop for a person to edit the Khmer |
+| `original_volume` | decimal(3,2) | default 0; original sound under the voice, 0 (off) to 1 |
 | `status` | string | `queued`, `processing`, `review`, `done`, `failed` |
 | `progress` | tinyint | 0 to 100 |
 | `message` | string, nullable | current step text |
@@ -254,7 +255,7 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 
 **Files and responsibilities**
 
-- `VideoJobController`: `index` (page and history), `store` (validate, save, dispatch), `status` (JSON), `download` (`srt` or `video`), `review` (edit page), `saveReview` (send the edits, dispatch again).
+- `VideoJobController`: `index` (page and history), `store` (validate, save, dispatch), `status` (JSON), `download` (`srt` or `video`), `preview` (`video` with range requests, or the subtitles as `vtt`, for the page's player), `review` (edit page), `saveReview` (send the edits, dispatch again).
 - `ProcessVideoJob`: sends the upload to `POST /jobs`, polls `GET /jobs/{id}` every 4 seconds, updates the row, ends if the job waits for review (`saveReview` dispatches it again), then downloads both results into `storage/app/results/{id}/`. Set `$timeout = 3600` and `$tries = 1`. On any exception, set `status=failed` and store the message.
 - Config in `config/services.php` under `dubber` (`url`, `token`). Read both from `.env`.
 
@@ -267,13 +268,14 @@ GET  /dub/{job}/status           status (JSON)
 GET  /dub/{job}/review           review (page)
 POST /dub/{job}/review           saveReview
 GET  /dub/{job}/download/{kind}  download (kind = srt | video)
+GET  /dub/{job}/preview/{kind}   preview (kind = video | vtt), inline for the player
 ```
 
-**Validation**: video required, `mimes:mp4,mov,mkv,webm`, maximum 512000 KB, `gender` in `male,female`, `dub` boolean, `review` boolean.
+**Validation**: video required, `mimes:mp4,mov,mkv,webm`, maximum 512000 KB, `gender` in `male,female`, `dub` boolean, `review` boolean, `original_volume` number from 0 to 1.
 
-**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, a progress bar, a status message, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
+**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, an original sound slider (0 to 100%, starts at Off, shown only when dubbing), a progress bar, a status message, a video player with the Khmer subtitles that shows a dubbed result when done, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
 
-**Security basics**: add Laravel Breeze (free) for login in the last phase, then make `status` and `download` check `job->user_id === auth()->id()`. Never expose the worker port outside the machine.
+**Security basics**: add Laravel Breeze (free) for login in the last phase, then make `status`, `download` and `preview` check `job->user_id === auth()->id()`. Never expose the worker port outside the machine.
 
 ## Build phases and acceptance checks
 
