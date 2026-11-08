@@ -103,7 +103,7 @@ button.danger { background: #b3134f; color: #ffffff; }
 label { display: block; font-weight: 600; margin-bottom: .3rem; }
 .field { margin-bottom: 1rem; border: 0; padding: 0; min-width: 0; }
 .field legend { font-weight: 600; margin-bottom: .3rem; padding: 0; }
-input[type=text], input[type=email], input[type=password], select, textarea {
+input[type=text], input[type=search], input[type=email], input[type=password], select, textarea {
     width: 100%; font: inherit; color: inherit; padding: .65rem .8rem; border: 2px solid var(--line);
     border-radius: 12px; background: var(--well);
 }
@@ -276,7 +276,7 @@ button.close:focus-visible { outline: 3px solid var(--lotus); outline-offset: 2p
 @keyframes fade { from { opacity: 0; } }
 
 /* Your videos */
-.videos { padding-top: 2rem; padding-bottom: 2rem; }
+.videos { padding-top: 2rem; padding-bottom: 2rem; scroll-margin-top: 1rem; }
 .videos h2 { font-size: 1.4rem; }
 table { width: 100%; border-collapse: collapse; }
 td { padding: .7rem .75rem .7rem 0; border-top: 2px solid var(--line); vertical-align: middle; }
@@ -294,6 +294,17 @@ td.results { text-align: right; white-space: nowrap; }
 .results button { padding: .05rem .4rem; font-size: .875rem; }
 tr.closing { animation: vanish .2s ease both; }
 .empty { color: var(--ink-soft); }
+.finder { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-bottom: 1rem; }
+.finder input { flex: 1 1 14rem; min-width: 0; }
+.finder select { width: auto; flex: 0 1 12rem; }
+.finder button { padding: .6rem 1.2rem; }
+.finder .clear { color: var(--ink-soft); font-weight: 600; }
+.pager { display: flex; justify-content: space-between; align-items: center; gap: .75rem; margin-top: 1rem; padding-top: 1rem; border-top: 2px solid var(--line); }
+.pager a { color: var(--lotus); font-weight: 700; text-decoration: none; }
+.pager a:hover { text-decoration: underline; }
+.pager span[aria-disabled] { color: var(--ink-soft); opacity: .5; }
+.page-of { color: var(--ink-soft); font-size: .925rem; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .small-print { font-size: .875rem; color: var(--ink-soft); max-width: 42rem; padding-bottom: 2.5rem; }
 
 /* Review of the Khmer lines: a numbered list, because the lines are a sequence */

@@ -122,5 +122,15 @@
     "Not Found": "រកមិនឃើញ",
     "Forbidden": "មិនអនុញ្ញាត",
     "Page Expired": "ទំព័រផុតកំណត់",
-    "Server Error": "កំហុសម៉ាស៊ីនមេ"
+    "Server Error": "កំហុសម៉ាស៊ីនមេ",
+    "Search by file name": "ស្វែងរកតាមឈ្មោះឯកសារ",
+    "Status": "ស្ថានភាព",
+    "All statuses": "គ្រប់ស្ថានភាព",
+    "Search": "ស្វែងរក",
+    "Clear": "សម្អាត",
+    "No videos match your search": "រកមិនឃើញវីដេអូដែលត្រូវនឹងការស្វែងរករបស់អ្នក",
+    "Pages": "ទំព័រ",
+    "Previous": "មុន",
+    "Next": "បន្ទាប់",
+    "Page :page of :pages": "ទំព័រ :page នៃ :pages"
 }

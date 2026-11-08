@@ -24,8 +24,11 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class VideoJobController extends Controller
 {
-    /** Number of past jobs listed under the form. */
-    private const HISTORY = 20;
+    /** Number of past jobs on each page of the list under the form. */
+    private const PER_PAGE = 10;
+
+    /** The statuses the list can be filtered by. */
+    private const STATUSES = [VideoJob::QUEUED, VideoJob::PROCESSING, VideoJob::REVIEW, VideoJob::DONE, VideoJob::FAILED, VideoJob::CANCELLED];
 
     /** Seconds allowed for sending a video to the worker again. */
     private const TRANSFER_SECONDS = 600;
@@ -39,19 +42,34 @@ class VideoJobController extends Controller
     ];
 
     /**
-     * Show the upload form, the job being followed and the user's recent jobs.
+     * Show the upload form, the job being followed and the user's jobs, 10 to a page.
      *
+     * ?q= keeps the jobs whose file name contains the text, and ?status= the jobs with that status.
      * The followed job is ?job=<id> if it is the user's, or else their newest job that has not finished.
      */
     public function index(Request $request): View
     {
-        $jobs = $request->user()->videoJobs()->latest('id')->limit(self::HISTORY)->get();
+        $search = Str::limit(trim($request->string('q')->toString()), 100, '');
+        $status = in_array($request->query('status'), self::STATUSES, true) ? $request->query('status') : '';
+
+        $jobs = $request->user()->videoJobs()
+            ->when($search !== '', fn ($query) => $query->whereLike('original_name', "%{$search}%"))
+            ->when($status !== '', fn ($query) => $query->where('status', $status))
+            ->latest('id')
+            ->paginate(self::PER_PAGE)
+            ->appends(array_filter(['q' => $search, 'status' => $status]));
         $current = $request->filled('job')
             ? $request->user()->videoJobs()->find($request->integer('job'))
-            : $jobs->first(fn (VideoJob $job) => ! $job->isFinished());
+            : $request->user()->videoJobs()
+                ->whereNotIn('status', [VideoJob::DONE, VideoJob::FAILED, VideoJob::CANCELLED])
+                ->latest('id')
+                ->first();
 
         return view('dub.index', [
             'jobs' => $jobs,
+            'search' => $search,
+            'status' => $status,
+            'filtered' => $search !== '' || $status !== '',
             'current' => $current ? $this->statusData($current) : null,
             'options' => $request->user()->dubOptions(),
         ]);

@@ -124,9 +124,23 @@
             </form>
         </dialog>
 
-        <section class="videos">
+        <section class="videos" id="videos">
             <h2>{{ __('Your videos') }}</h2>
             <div class="panel">
+                {{-- #videos: the new page opens at this list, not at the top --}}
+                <form class="finder" method="GET" action="{{ route('dub.index') }}#videos" role="search">
+                    <label class="sr-only" for="find-q">{{ __('Search by file name') }}</label>
+                    <input id="find-q" type="search" name="q" value="{{ $search }}" maxlength="100" placeholder="{{ __('Search by file name') }}">
+                    <label class="sr-only" for="find-status">{{ __('Status') }}</label>
+                    <select id="find-status" name="status">
+                        <option value="">{{ __('All statuses') }}</option>
+                        @foreach ($statusLabel as $value => $label)
+                            <option value="{{ $value }}" @selected($status === $value)>{{ $label }}</option>
+                        @endforeach
+                    </select>
+                    <button type="submit">{{ __('Search') }}</button>
+                    @if ($filtered)<a class="clear" href="{{ route('dub.index') }}#videos">{{ __('Clear') }}</a>@endif
+                </form>
                 <table>
                     <tbody id="history">
                     @forelse ($jobs as $job)
@@ -143,10 +157,17 @@
                             </td>
                         </tr>
                     @empty
-                        <tr id="history-empty"><td class="empty" colspan="4">{{ __('No videos yet') }}</td></tr>
+                        <tr id="history-empty"><td class="empty" colspan="4">{{ $filtered ? __('No videos match your search') : __('No videos yet') }}</td></tr>
                     @endforelse
                     </tbody>
                 </table>
+                @if ($jobs->hasPages())
+                    <nav class="pager" aria-label="{{ __('Pages') }}">
+                        @if ($jobs->onFirstPage())<span aria-disabled="true">← {{ __('Previous') }}</span>@else<a href="{{ $jobs->previousPageUrl() }}#videos" rel="prev">← {{ __('Previous') }}</a>@endif
+                        <span class="page-of">{{ __('Page :page of :pages', ['page' => $jobs->currentPage(), 'pages' => $jobs->lastPage()]) }}</span>
+                        @if ($jobs->hasMorePages())<a href="{{ $jobs->nextPageUrl() }}#videos" rel="next">{{ __('Next') }} →</a>@else<span aria-disabled="true">{{ __('Next') }} →</span>@endif
+                    </nav>
+                @endif
             </div>
         </section>
 
@@ -163,7 +184,15 @@
         const TEXT = @json($texts);
         const POLL_MS = 3000;
         const GLIDE_MS = 700;
+        // New jobs join the list only on its first page with no search or filter, where they belong.
+        const LIVE_LIST = @json($jobs->onFirstPage() && ! $filtered);
         const $ = (id) => document.getElementById(id);
+        /** This page's address following job `id` (or none), keeping the search, filter and page. */
+        const pageUrl = (id) => {
+            const params = new URLSearchParams(location.search);
+            id ? params.set('job', id) : params.delete('job');
+            return `${location.pathname}${params.size ? `?${params}` : ''}`;
+        };
         const form = $('upload'), start = $('start'), errors = $('errors'), video = $('video'), drop = $('drop');
         const level = $('original-volume'), dub = form.elements.dub;
         const SEND_HEADERS = { Accept: 'application/json', 'X-CSRF-TOKEN': form.elements._token.value };
@@ -278,6 +307,7 @@
         function renderRow(job) {
             let row = document.querySelector(`#history tr[data-id="${job.id}"]`);
             if (!row) {
+                if (!LIVE_LIST) return;
                 $('history-empty')?.remove();
                 row = document.createElement('tr');
                 row.dataset.id = job.id;
@@ -356,7 +386,7 @@
         function hideCard(then) {
             const card = $('job');
             showPlayer({}); // stops the sound and the download
-            history.replaceState(null, '', location.pathname);
+            history.replaceState(null, '', pageUrl(null));
             card.classList.add('closing');
             setTimeout(() => {
                 card.classList.remove('closing');
@@ -456,6 +486,9 @@
             }, 200);
         }
 
+        /** Choosing a status shows it at once; the search text waits for Enter or the button. */
+        $('find-status').addEventListener('change', (event) => event.target.form.requestSubmit());
+
         /** Open a video from the history without leaving the page. Ctrl or Shift click still opens the link. */
         $('history').addEventListener('click', async (event) => {
             const remove = event.target.closest('button[data-delete-url]');
@@ -466,7 +499,7 @@
             const link = event.target.closest('a[data-status-url]');
             if (!link || event.ctrlKey || event.metaKey || event.shiftKey) return;
             event.preventDefault();
-            history.replaceState(null, '', link.href);
+            history.replaceState(null, '', pageUrl(link.closest('tr').dataset.id));
             await poll(link.dataset.statusUrl);
             showJob();
             if (link.classList.contains('play')) $('job-player').play().catch(() => {}); // a browser may refuse; its own button still works
@@ -557,7 +590,7 @@
                 const response = await fetch(form.action, { method: 'POST', body: new FormData(form), headers: { Accept: 'application/json' } });
                 if (response.status === 201) {
                     const { id, status_url: url } = await response.json();
-                    history.replaceState(null, '', `?job=${id}`);
+                    history.replaceState(null, '', pageUrl(id));
                     video.value = ''; // only the file: the choices stay for the next video
                     showFile();
                     poll(url);

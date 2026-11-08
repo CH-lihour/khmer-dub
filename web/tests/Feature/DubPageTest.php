@@ -73,6 +73,48 @@ class DubPageTest extends TestCase
             ->assertSee(route('dub.download', [$job, 'srt']));
     }
 
+    public function test_history_shows_ten_jobs_to_a_page(): void
+    {
+        foreach (range(1, 12) as $n) {
+            $this->makeJob(['original_name' => sprintf('clip-%02d.mp4', $n), 'status' => 'done']);
+        }
+
+        $this->get('/dub')->assertOk()
+            ->assertSee('clip-12.mp4')->assertSee('clip-03.mp4')->assertDontSee('clip-02.mp4')
+            ->assertSee('Page 1 of 2')->assertSee('/dub?page=2', false);
+        $this->get('/dub?page=2')->assertOk()
+            ->assertSee('clip-02.mp4')->assertSee('clip-01.mp4')->assertDontSee('clip-03.mp4')
+            ->assertSee('Page 2 of 2');
+    }
+
+    public function test_history_can_be_searched_and_filtered_by_status(): void
+    {
+        $this->makeJob(['original_name' => 'Cooking Lesson.mp4', 'status' => 'done']);
+        $this->makeJob(['original_name' => 'cooking failed.mp4', 'status' => 'failed']);
+        $this->makeJob(['original_name' => 'news.mp4', 'status' => 'done']);
+        $this->makeJob(['original_name' => 'cooking secret.mp4', 'status' => 'done'], User::factory()->create());
+
+        $this->get('/dub?q=cooking')->assertOk()
+            ->assertSee('Cooking Lesson.mp4')->assertSee('cooking failed.mp4')
+            ->assertDontSee('news.mp4')->assertDontSee('cooking secret.mp4')
+            ->assertSee('value="cooking"', false)->assertSee('Clear');
+        $this->get('/dub?q=cooking&status=failed')->assertOk()
+            ->assertSee('cooking failed.mp4')->assertDontSee('Cooking Lesson.mp4');
+        $this->get('/dub?status=bogus')->assertOk()
+            ->assertSee('news.mp4')->assertSee('cooking failed.mp4');
+        $this->get('/dub?q=nothing-like-this')->assertOk()->assertSee('No videos match your search');
+    }
+
+    public function test_history_pages_keep_the_search(): void
+    {
+        foreach (range(1, 11) as $n) {
+            $this->makeJob(['original_name' => "talk-{$n}.mp4", 'status' => 'done']);
+        }
+
+        $this->get('/dub?q=talk&status=done')->assertOk()
+            ->assertSee('/dub?q=talk&amp;status=done&amp;page=2', false);
+    }
+
     public function test_page_follows_the_newest_unfinished_job(): void
     {
         $this->makeJob(['original_name' => 'finished.mp4', 'status' => 'done']);
