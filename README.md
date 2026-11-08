@@ -74,7 +74,10 @@ docker compose exec web php artisan test
 They run on an in-memory SQLite database and a fake worker, so they never touch MySQL or the
 real worker. Compose passes `web/.env` to the container as real environment variables, so
 `web/phpunit.xml` forces every test setting in both `<env force="true">` and `<server>`, and
-`tests/TestCase.php` refuses to start on any database but in-memory SQLite.
+`tests/TestCase.php` refuses to start on any database but in-memory SQLite. The tests also have
+their own `APP_KEY` there: on a fresh clone the containers start with an empty one, and only the
+site's own process sees the key written to `web/.env` until the containers are recreated
+(`docker compose up -d --force-recreate web queue scheduler`).
 
 ## Worker tests
 
@@ -178,7 +181,7 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 
 | Call | Answer |
 | --- | --- |
-| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`) | `{"job_id": "<32 hex>"}` |
+| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`, `language` = a Whisper code or empty to detect it, `separate` = `true`/`false`) | `{"job_id": "<32 hex>"}` |
 | `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language", "done", "total"}` |
 | `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` or `done` |
 | `POST /jobs/{id}/reopen` (multipart `file`, the original video) | `{"status": "review"}`, to make a done job's results again |
@@ -245,7 +248,32 @@ docker compose exec web sh -c 'curl -sS -w " %{http_code}\n" -H "x-token: $DUBBE
 
 http://localhost:8000/dub has one page: a file input, a voice choice (female Sreymom or male
 Piseth), a **Dub the video** switch (off gives Khmer subtitles only), a progress bar that
-updates every 3 seconds, download links when the job is done, and your last 20 videos.
+follows the upload and then updates every 3 seconds, download links when the job is done, and
+your last 20 videos.
+
+**Spoken language** is set to **Detect it**; choose a language when Whisper picks the wrong one
+(the list is the languages the worker can translate). **Remove the original speech** (shown while
+dubbing) takes the speech out of the original sound and keeps the music and effects, which then
+play at the **Original sound** level; turning it on raises that level from Off to 100%. While a
+video waits, the page says how many videos are ahead of it. A dubbed MP4 also carries the Khmer
+subtitles as a track that players such as VLC can switch on; the `.srt` download stays as well.
+
+The ▶ on each voice plays a short sample from `web/public/voices/` (`female.mp3`, `male.mp3`,
+about 27 KB each). They were made once with edge-tts and are not made again on their own. To
+remake them, for example after changing the sentence:
+
+```bash
+docker compose exec worker edge-tts --voice km-KH-SreymomNeural --text "សួស្តី! ខ្ញុំនឹងអានអត្ថបទខ្មែររបស់អ្នក។" --write-media /tmp/female.mp3
+docker compose cp worker:/tmp/female.mp3 web/public/voices/female.mp3
+```
+
+and the same with `km-KH-PisethNeural` and `male.mp3`. With `TTS_ENGINE=mms` the video uses the
+one offline voice, which sounds like neither sample.
+
+Messages from the worker are stored in English and shown in the page's language by
+`App\Support\Worker::say()`. A new worker message needs its Khmer in `web/lang/km.json`, and a
+message with a value inside (a length, a file type) also needs a pattern in `Worker::PATTERNS`.
+`tests/Feature/WorkerMessageTest.php` lists them.
 
 The look is plain CSS in `web/public/css/site.css`, with no build step. Its colours are tokens at the
 top of that file, and light and dark follow the system setting. The checked pattern on every page
@@ -306,7 +334,11 @@ Turn on **Edit the Khmer first** when uploading. Without it, a job runs straight
    **Check the Khmer** link. The job holds no worker thread and no queue slot while it waits, so
    other videos go ahead of it. It can wait for days, up to the 7 day cleanup.
 2. The review page shows each line's time and original text above its Khmer. Correct the text, or
-   empty a line to remove it from both the subtitles and the voice.
+   empty a line to remove it from both the subtitles and the voice. The uploaded video plays at the
+   top of the page: **â¶ 0:01 â 0:04** on a line plays just that line, and the line being said is
+   marked while the video plays. For a dubbed video, a line whose Khmer looks too long for its
+   time is marked "Long for its time" (the voice will be sped up) or "Too long for its time" (its
+   end may be cut), so you can shorten it before saving.
    A line with letters but no Khmer ones cannot be saved, because the Khmer voice cannot read it.
    Khmer with a Latin name in it, or a line of only digits, is fine.
 3. **Save and make the voice** (or **Save the subtitles**) resumes the job with your text.
@@ -320,8 +352,10 @@ if making it fails, the old one stays and the page shows the reason. Editing wor
 video's files are deleted, 7 days after upload, and regenerating does not extend that.
 Subtitles-only jobs cannot be edited this way yet.
 
-Your edits are kept if something goes wrong after saving. If the voice service is down or the
-worker restarts, the job returns to **Needs review** with the reason, and saving again retries it.
+Your edits are kept if something goes wrong after saving. If the voice service is down, the job
+returns to **Needs review** with the reason, and saving again retries it. If the worker restarts,
+the job goes on by itself; only if it restarts a second time during the same run does the job
+return to **Needs review** with the reason.
 
 ## Accounts
 
@@ -335,8 +369,9 @@ itself was removed again, because nothing uses it after scaffolding.
 - Each video belongs to the user who uploaded it. The page lists only your videos. Another user's
   `/dub/<id>/status` or `/dub/<id>/download/...` answers 403 "This video belongs to another
   account."
-- No real email is sent (`MAIL_MAILER=log`). A password reset link is written to
-  `web/storage/logs/laravel.log`; copy it from there.
+- Email (password reset links) goes to Mailpit, a local inbox: open http://localhost:8025. It
+  never leaves your computer, and Mailpit forgets it when it restarts. `compose.yaml` sets the
+  `MAIL_` settings for this over `web/.env`.
 - Deleting your account deletes your videos, uploads and results at once. The worker's copies
   go at the next daily cleanup once they are 7 days old.
 - Email addresses are not verified. That is fine on your own machine. Do not put this site
@@ -383,6 +418,7 @@ Keep `post_max_size` a little above `upload_max_filesize`, and change the `max:5
 | `scheduler` | same as `web`              | `php artisan schedule:work` (daily `dub:cleanup`) | none |
 | `mysql`  | `mysql:9.7.4` (LTS)           | database                          | none |
 | `worker` | `python:3.14.10-slim-trixie` + FFmpeg 7.1 | FastAPI on `worker:8001` | none |
+| `mailpit` | `axllent/mailpit:v1.33.1` | catches the site's email; inbox at http://localhost:8025 | 8025 (this computer only) |
 
 On a new database the `queue` service waits, printing "waiting for php artisan migrate",
 until you run the migrate command. Then it becomes healthy. `queue` and `scheduler` start after
@@ -407,7 +443,10 @@ the 16 kHz WAV itself and passes Whisper the samples.
 
 | Component | License |
 | --- | --- |
-| Laravel, FastAPI, faster-whisper, CTranslate2, pydub, pytest | MIT |
+| Laravel, FastAPI, faster-whisper, CTranslate2, pydub, pytest, Demucs, einops, julius, Mailpit | MIT |
+| sphn (used by Demucs) | Apache-2.0 |
+| lameenc (used by Demucs) | LGPL-3.0 |
+| Demucs `htdemucs` model weights | MIT |
 | Laravel Breeze (used once to scaffold the login code, then removed) | MIT |
 | Kantumruy Pro font (`web/public/fonts/`, license in `OFL.txt`) | SIL OFL 1.1 |
 | Uvicorn, PyTorch, httpx | BSD-3-Clause |
@@ -424,37 +463,49 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - Free translation (NLLB) is less natural than a paid LLM and can mistranslate names and numbers.
   Khmer output needs review by a Khmer speaker.
 - NLLB puts a space between every Khmer word, which normal Khmer writing does not do.
+  `KHMER_SPACES=remove` in `worker/.env` joins the Khmer words (spaces next to punctuation, digits
+  and Latin words stay). It is off until a Khmer speaker has compared both. Without spaces, a
+  player that cannot break Khmer words may not wrap a long subtitle line.
 - With plain beam search, NLLB can loop on short or list-like lines ("អ៊ូ! អ៊ូ! អ៊ូ! ...").
   The worker blocks repeated 3-word sequences to stop this. As a side effect, it may reword a
   phrase that really is said twice in one line.
-- CPU translation takes about 4 to 5 seconds per segment (37 s for the 8 segments of the 1 minute
-  test clip), longer than transcription.
+- Translation runs NLLB in CTranslate2 with int8 weights: 3.6 s for the 8 lines of the 1 minute
+  test clip, against 30 s in transformers. The output is almost the same; on that clip 4 of 8 lines
+  came out word for word the same and the rest differed by a word or two. The first job converts
+  the model once (about 30 s, 630 MB more in `hf_cache`).
 - `edge-tts` is unofficial and needs internet. It may change or stop working. Set `TTS_ENGINE=mms`
   for the fully offline (more robotic) voice. It sometimes sends no audio for an ordinary
   sentence. The worker retries, and the job fails with a message after three tries.
 - MMS-TTS cannot read digits or Latin letters, and NLLB writes numbers as Khmer digits
   (`៥, ៤, ៣`), so with `mms` the numbers are silent.
 - The original music and sound effects stay in the dubbed video, but so does the original speech,
-  quietly under the Khmer voice. Removing only the speech would need a separation tool such as
-  Demucs (MIT), about 1.5 to 3 times the video length on CPU. The sound is mono.
+  quietly under the Khmer voice, unless **Remove the original speech** is on. That runs Demucs
+  (MIT) and takes about half the video length on CPU (34 s for the 1 minute test clip); the first
+  time it downloads its model (about 80 MB). Demucs is not perfect: some speech can remain, and
+  singing is removed with the speech. The sound is mono.
 - Khmer is often longer than the original, so the voice can keep talking after the speaker has
   stopped (up to 0.8 s on the test clip). Lines with no silence after them are sped up instead,
   and can still lose the end of their speech even at x1.6.
 - Making the voice takes about 2 seconds per line with edge-tts.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
-- The worker runs one job at a time, so an upload can wait in the queue behind a long video.
-  Restarting the worker fails the job that was running.
-- The page cannot show how far a large upload has got; it shows "Uploading" until the server has
-  the whole file. `php artisan serve` is a development server with four PHP processes, and a slow
-  upload or a video open in the player holds one each. About four at once make the site wait.
+- The worker runs one job at a time, so an upload can wait in the queue behind a long video; the
+  page says how many videos are ahead. A worker restart puts the jobs it was working on back in
+  line, going on from the voice if the Khmer was ready, or else from the start. If the same run is
+  interrupted twice, the job fails (or goes back to review), in case it is what stops the worker.
+- `php artisan serve` is a development server with four PHP processes, and a slow upload or a
+  video open in the player holds one each. About four at once make the site wait.
 - The Khmer text of the site (`web/lang/km.json`) was written by AI and needs review by a Khmer
-  speaker. Error messages from the worker stay in English, also on the Khmer pages.
-- The review page edits text only. It cannot change a line's timing, split or join lines, or play
-  the video, so keep the video open next to it. An edited line that is much longer than the
-  original may be sped up or cut like any other.
-- No email is sent, so password reset links must be copied from `web/storage/logs/laravel.log`,
-  and email addresses are not verified. The site is meant for your own machine, not the internet
+  speaker. A few worker messages only a developer can cause (a wrong API call, an unknown
+  `TTS_ENGINE`) stay in English, as does any new worker message until its Khmer is added.
+- The review page edits text only. It cannot change a line's timing or split or join lines. Its
+  player plays the uploaded video, which a browser may not be able to play (MKV, or MOV with
+  HEVC); then keep the video open in another player. The "Long for its time" and "Too long" marks
+  are an estimate (about 15 Khmer letters a second with edge-tts), not a measurement.
+- Email goes only to Mailpit on this computer (http://localhost:8025), never to a real inbox, and
+  email addresses are not verified. The site is meant for your own machine, not the internet
   (`php artisan serve`, debug mode on, no HTTPS).
+- Choosing the spoken language helps when detection picks the wrong one, but Whisper still writes
+  what it hears in that language: choosing the wrong language gives a wrong transcript.
 - Videos, results and worker job folders are deleted 7 days after upload. Download what you
   want to keep.
 - Whisper `small` sometimes mishears words (for example "timed" as "time"), and over music or

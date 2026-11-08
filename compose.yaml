@@ -6,6 +6,14 @@ x-web-build: &web-build
     UID: ${UID:-1000}
     GID: ${GID:-1000}
 
+# Laravel sends its email (password reset links) to Mailpit, whose inbox is http://localhost:8025.
+# Set here, over web/.env, so the MAIL_ lines there need no change.
+x-mail: &mail
+  MAIL_MAILER: smtp
+  MAIL_SCHEME: smtp
+  MAIL_HOST: mailpit
+  MAIL_PORT: "1025"
+
 services:
   web:
     build: *web-build
@@ -18,12 +26,15 @@ services:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
       PHP_CLI_SERVER_WORKERS: "4"
+      <<: *mail
     volumes:
       - ./web:/var/www/html
     ports:
       - "8000:8000"
     depends_on:
       mysql:
+        condition: service_healthy
+      mailpit:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/up"]
@@ -49,6 +60,7 @@ services:
     environment:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
+      <<: *mail
     volumes:
       - ./web:/var/www/html
     depends_on:
@@ -77,6 +89,7 @@ services:
     environment:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
+      <<: *mail
     volumes:
       - ./web:/var/www/html
     depends_on:
@@ -124,6 +137,20 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
+
+  # Catches every email the site sends; nothing leaves the machine. Inbox: http://localhost:8025.
+  # Both ports stay on this computer: 8025 is published to 127.0.0.1 only.
+  mailpit:
+    image: axllent/mailpit:v1.33.1 # latest when added; MIT licence
+    ports:
+      - "127.0.0.1:8025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

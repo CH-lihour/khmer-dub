@@ -4,14 +4,20 @@
     $steps = [
         ['from' => 0, 'label' => __('Sending the video to the worker')],
         ['from' => 5, 'label' => __('Extracting audio')],
-        ['from' => 15, 'label' => __('Transcribing speech')],
+        ['from' => 15, 'label' => __('Transcribing speech'), 'clock' => true],
         ['from' => 45, 'label' => __('Translating to Khmer')],
         ['from' => 60, 'label' => __('Making the Khmer voice'), 'voice' => true],
-        ['from' => 85, 'label' => __('Mixing and merging'), 'voice' => true],
+        ['from' => 85, 'label' => __('Mixing and merging'), 'voice' => true, 'separate' => false],
+        // With the original speech taken out: that comes first, then the mix from 92.
+        ['from' => 85, 'label' => __('Removing the original speech'), 'voice' => true, 'separate' => true, 'clock' => true],
+        ['from' => 92, 'label' => __('Mixing and merging'), 'voice' => true, 'separate' => true],
         ['from' => 99, 'label' => __('Downloading the results')],
     ];
     $texts = [
         'uploading' => __('Uploading'),
+        'sent' => __(':sent of :total MB'),
+        'aheadOne' => __('1 video ahead of yours'),
+        'aheadMany' => __(':count videos ahead of yours'),
         'lines' => __(':done of :total lines'),
         'review' => __('Review'),
         'cancelLost' => __('The work so far will be lost, and you will need to upload the video again.'),
@@ -30,6 +36,14 @@
         'expired' => __('The page has expired. Reload it and try again.'),
         'uploadFailed' => __('The upload failed (HTTP :status). Please try again.'),
         'unreachable' => __('The site could not be reached. Check that it is running and try again.'),
+        'uploaded' => __('Uploaded. The work has started.'),
+        'otherGoesOn' => __('The other video keeps going. Find it in Your videos.'),
+        'ready' => __(':name is ready.'),
+        'readyToCheck' => __('The Khmer of :name is ready to check.'),
+        'failed' => __(':name failed.'),
+        'stopped' => __(':name was stopped.'),
+        'deleted' => __(':name was deleted.'),
+        'choicesLost' => __('Your choices could not be remembered. They still apply to this video.'),
     ];
     $originalVolume = (float) old('original_volume', $options['original_volume']);
     $gender = old('gender', $options['gender']);
@@ -50,6 +64,16 @@
                     <span id="drop-name" class="drop-name"></span>
                 </label>
 
+                <div class="spoken">
+                    <label for="spoken-language">{{ __('Spoken language') }}</label>
+                    <select id="spoken-language" name="spoken_language">
+                        <option value="">{{ __('Detect it') }}</option>
+                        @foreach (\App\Models\VideoJob::spokenLanguages() as $code => $name)
+                            <option value="{{ $code }}" @selected(old('spoken_language') === $code)>{{ $name }}</option>
+                        @endforeach
+                    </select>
+                </div>
+
                 <x-voice-choice :selected="$gender" />
 
                 <label class="toggle">
@@ -57,6 +81,10 @@
                     <span>{{ __('Dub the video') }}</span>
                 </label>
                 <x-original-sound :level="$originalVolume" :off="! $dubbing" />
+                <label id="separate-row" @class(['toggle', 'off' => ! $dubbing])>
+                    <input type="checkbox" name="separate" value="1" @checked($errors->any() ? old('separate') : $options['separate']) @disabled(! $dubbing)><i></i>
+                    <span>{{ __('Remove the original speech') }} <small class="hint">{{ __('Keeps music and effects. Takes about half the video length longer.') }}</small></span>
+                </label>
                 <label class="toggle">
                     <input type="checkbox" name="review" value="1" @checked($errors->any() ? old('review') : $options['review'])><i></i>
                     <span>{{ __('Edit the Khmer first') }}</span>
@@ -196,7 +224,10 @@
         const form = $('upload'), start = $('start'), errors = $('errors'), video = $('video'), drop = $('drop');
         const level = $('original-volume'), dub = form.elements.dub;
         const SEND_HEADERS = { Accept: 'application/json', 'X-CSRF-TOKEN': form.elements._token.value };
+        const TITLE = document.title;
         let timer = null, glide = null, saving = false, changed = false, deleting = null;
+        // shown: the job the card last drew. uploading: a file is on its way. cancelling: Stop was asked for.
+        let shown = null, uploading = false, cancelling = false, choicesWarned = false;
 
         function showErrors(list) {
             errors.replaceChildren(...list.map((text) => Object.assign(document.createElement('li'), { textContent: text })));
@@ -218,7 +249,16 @@
             level.style.setProperty('--fill', `${percent}%`);
             level.disabled = !dub.checked;
             $('original-sound').classList.toggle('off', !dub.checked);
+            form.elements.separate.disabled = !dub.checked;
+            $('separate-row').classList.toggle('off', !dub.checked);
         }
+
+        /** Without speech, the original sound is music and effects: turn it up if it was off, or there is nothing to hear. */
+        form.elements.separate.addEventListener('change', () => {
+            if (!form.elements.separate.checked || Number(level.value) > 0) return;
+            level.value = 1;
+            showLevel();
+        });
 
         /** Load the job's dubbed video into the player, or empty and hide the player if it has none. */
         function showPlayer(job) {
@@ -235,13 +275,16 @@
             player.load();
         }
 
+        /** A text with the video's name in it. A function, so that "$" in a file name is kept as it is. */
+        const named = (text, name) => text.replace(':name', () => name);
+
         /** "1:05" for a time in seconds. */
         const clock = (seconds) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 
         /** How far a step is: seconds of the video while transcribing, lines after that. */
         function stepCount(job, step) {
             if (job.step_total == null) return '';
-            if (step.from === 15) return `${clock(job.step_done)} / ${clock(job.step_total)}`;
+            if (step.clock) return `${clock(job.step_done)} / ${clock(job.step_total)}`; // seconds of the video
             return TEXT.lines.replace(':done', job.step_done).replace(':total', job.step_total);
         }
 
@@ -260,7 +303,7 @@
             $('job-count').textContent = '';
             if (toggle.disabled) return foldSteps(false);
 
-            const steps = STEPS.filter((step) => job.dub !== false || !step.voice);
+            const steps = STEPS.filter((step) => (job.dub !== false || !step.voice) && (step.separate ?? Boolean(job.separate)) === Boolean(job.separate));
             if (list.children.length !== steps.length) {
                 list.replaceChildren(...steps.map((step) => Object.assign(document.createElement('li'), { textContent: step.label })));
             }
@@ -270,10 +313,13 @@
                 item.className = i < now ? 'done' : i > now || job.status === 'review' ? '' : state;
             });
             if (job.status === 'processing') $('job-count').textContent = stepCount(job, steps[now]);
+            else if (job.ahead) $('job-count').textContent = job.ahead === 1 ? TEXT.aheadOne : TEXT.aheadMany.replace(':count', job.ahead);
         }
 
         /** Draw a job (the JSON from the status route) in the progress card and in its history row. */
         function render(job) {
+            const before = shown;
+            shown = job;
             $('job').hidden = false;
             $('job').dataset.id = job.id ?? '';
             $('job-name').textContent = job.name;
@@ -302,6 +348,22 @@
                 $(id).href = url || '#';
             }
             if (job.id) renderRow(job);
+            // The same job, followed until it has just stopped (not one opened that had stopped already).
+            if (before?.id && before.id === job.id && before.status !== job.status && stopped(job.status)) announce(job);
+        }
+
+        /** Say how a job the page was following has ended: ready, ready to check, stopped or failed. */
+        function announce(job) {
+            const asked = cancelling;
+            cancelling = false;
+            let text = named(TEXT.failed, job.name), kind = 'bad';
+            if (asked && ['cancelled', 'review'].includes(job.status)) [text, kind] = [named(TEXT.stopped, job.name), 'ok'];
+            else if (job.error) text = `${job.name}: ${job.error}`;
+            else if (job.status !== 'failed') {
+                [text, kind] = [named({ done: TEXT.ready, review: TEXT.readyToCheck, cancelled: TEXT.stopped }[job.status], job.name), 'ok'];
+            }
+            toast(text, kind);
+            if (document.hidden) document.title = `${kind === 'bad' ? '⚠' : '✓'} ${TITLE}`; // seen on the tab
         }
 
         function renderRow(job) {
@@ -418,6 +480,7 @@
         async function cancelJob() {
             const button = $('job-cancel');
             button.disabled = true;
+            cancelling = true; // so that the end of the job is told as stopped
             let problem = TEXT.unreachable;
             try {
                 const response = await fetch(button.dataset.url, { method: 'POST', headers: SEND_HEADERS });
@@ -430,6 +493,7 @@
             } catch (error) {
                 // the site could not be reached, as `problem` says
             }
+            cancelling = false;
             button.disabled = false;
             $('job-error').hidden = false;
             $('job-error').textContent = problem;
@@ -437,7 +501,7 @@
 
         /** Ask whether to delete a job, naming it. */
         function askToDelete(url, id, name) {
-            deleting = { url, id };
+            deleting = { url, id, name };
             $('delete-name').textContent = name;
             $('delete-error').hidden = true;
             $('delete-confirm').disabled = false;
@@ -453,6 +517,7 @@
                 const response = await fetch(deleting.url, { method: 'DELETE', headers: SEND_HEADERS });
                 if (response.ok) {
                     $('delete-dialog').close();
+                    toast(named(TEXT.deleted, deleting.name));
                     return removeJob(deleting.id);
                 }
                 problem = (await response.json()).message;
@@ -569,7 +634,11 @@
                 const choices = new FormData(form);
                 choices.delete('video');
                 await fetch(@json(route('dub.options')), { method: 'POST', body: choices, headers: { Accept: 'application/json' }, keepalive: true })
-                    .catch(() => {}); // the choice still applies to this upload; only remembering it failed
+                    .then((response) => { if (!response.ok) throw new Error(`HTTP ${response.status}`); })
+                    .catch(() => { // the choice still applies to this upload; only remembering it failed
+                        if (!choicesWarned) toast(TEXT.choicesLost, 'bad');
+                        choicesWarned = true;
+                    });
             }
             saving = false;
         }
@@ -578,6 +647,38 @@
             if (event.target !== video) saveChoices();
         });
 
+        /**
+         * Post the upload form, telling `progress(sent, total)` how far it has got: fetch cannot say
+         * how much of a request has gone, XMLHttpRequest can. Gives {status, body}, the body being
+         * the JSON answer or null; rejects if the site cannot be reached.
+         */
+        function send(data, progress) {
+            return new Promise((resolve, reject) => {
+                const request = new XMLHttpRequest();
+                request.open('POST', form.action);
+                request.setRequestHeader('Accept', 'application/json');
+                request.responseType = 'json';
+                request.upload.addEventListener('progress', (event) => {
+                    if (event.lengthComputable) progress(event.loaded, event.total);
+                });
+                request.addEventListener('load', () => resolve({ status: request.status, body: request.response }));
+                request.addEventListener('error', () => reject(new Error('The site could not be reached')));
+                request.send(data);
+            });
+        }
+
+        /** "12.5" or "240": megabytes, with one decimal while small. */
+        const megabytes = (bytes) => (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0);
+
+        /** Move the bar with the upload, and say how many megabytes have gone. */
+        function showUpload(sent, total) {
+            const percent = Math.floor(sent / total * 100), bar = $('job-bar');
+            $('job-percent').textContent = `${percent}%`;
+            bar.setAttribute('aria-valuenow', percent);
+            bar.firstElementChild.style.width = `${percent}%`;
+            $('job-count').textContent = TEXT.sent.replace(':sent', megabytes(sent)).replace(':total', megabytes(total));
+        }
+
         form.addEventListener('submit', async (event) => {
             event.preventDefault();
             const file = video.files[0];
@@ -585,21 +686,23 @@
             showErrors([]);
             clearTimeout(timer);
             start.disabled = true;
+            const other = shown?.id && !stopped(shown.status); // the card is about to stop showing it
             render({ name: file.name, status: 'queued', progress: 0, message: TEXT.uploading, error: null, dub: dub.checked });
+            uploading = true;
             try {
-                const response = await fetch(form.action, { method: 'POST', body: new FormData(form), headers: { Accept: 'application/json' } });
+                const response = await send(new FormData(form), showUpload);
                 if (response.status === 201) {
-                    const { id, status_url: url } = await response.json();
+                    const { id, status_url: url } = response.body;
                     history.replaceState(null, '', pageUrl(id));
                     video.value = ''; // only the file: the choices stay for the next video
                     showFile();
+                    toast(other ? `${TEXT.uploaded} ${TEXT.otherGoesOn}` : TEXT.uploaded);
                     poll(url);
                     return;
                 }
                 $('job').hidden = true;
                 if (response.status === 422) {
-                    const body = await response.json();
-                    showErrors(Object.values(body.errors || {}).flat());
+                    showErrors(Object.values(response.body?.errors || {}).flat());
                 } else if (response.status === 413) {
                     showErrors([TEXT.tooBig]);
                 } else if (response.status === 401) {
@@ -613,8 +716,20 @@
                 $('job').hidden = true;
                 showErrors([TEXT.unreachable]);
             } finally {
+                uploading = false;
                 start.disabled = false;
             }
+        });
+
+        /** Leaving or reloading the page would stop an upload on its way, so the browser asks first. */
+        addEventListener('beforeunload', (event) => {
+            if (!uploading) return;
+            event.preventDefault();
+            event.returnValue = ''; // older browsers ask only with this
+        });
+        /** The tab's title marks a job that ended while the page was hidden, until it is seen. */
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) document.title = TITLE;
         });
 
         const current = @json($current);

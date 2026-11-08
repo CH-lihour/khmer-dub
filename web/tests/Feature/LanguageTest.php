@@ -108,7 +108,7 @@ class LanguageTest extends TestCase
     public function test_every_worker_step_has_its_khmer(): void
     {
         $steps = ['Waiting in the queue', 'Sending the video to the worker', 'Starting', 'Extracting audio', 'Transcribing speech',
-            'Translating to Khmer', 'Waiting for your review', 'Making the Khmer voice', 'Mixing and merging', 'Downloading the results', 'Done', 'Failed'];
+            'Translating to Khmer', 'Waiting for your review', 'Making the Khmer voice', 'Removing the original speech', 'Mixing and merging', 'Downloading the results', 'Done', 'Failed'];
 
         foreach ($steps as $step) {
             $this->assertArrayHasKey($step, $this->khmer());

@@ -13,6 +13,7 @@ use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
@@ -39,6 +40,7 @@ class VideoJobController extends Controller
         'dub' => ['sometimes', 'boolean'],
         'review' => ['sometimes', 'boolean'],
         'original_volume' => ['sometimes', 'numeric', 'between:0,1'],
+        'separate' => ['sometimes', 'boolean'],
     ];
 
     /**
@@ -84,8 +86,10 @@ class VideoJobController extends Controller
     {
         $data = $request->validate([
             'video' => ['required', 'file', 'mimes:mp4,mov,mkv,webm', 'max:512000'],
+            'spoken_language' => ['nullable', Rule::in(VideoJob::SPOKEN_LANGUAGES)],
             ...self::OPTION_RULES,
         ], [
+            'spoken_language.in' => __('Choose a spoken language from the list, or Detect it.'),
             'video.required' => __('Choose a video file.'),
             'video.uploaded' => __('The video did not upload completely. It may be larger than 500 MB.'),
             'video.mimes' => __('This file type is not supported. Upload an MP4, MOV, MKV or WebM video.'),
@@ -107,6 +111,8 @@ class VideoJobController extends Controller
             'dub' => $request->boolean('dub'),
             'review' => $request->boolean('review'),
             'original_volume' => $data['original_volume'] ?? 0,
+            'spoken_language' => $data['spoken_language'] ?? null,
+            'separate' => $request->boolean('dub') && $request->boolean('separate'), // only a voice has sound under it
             'message' => 'Waiting in the queue',
         ]);
         ProcessVideoJob::dispatch($job);
@@ -155,7 +161,7 @@ class VideoJobController extends Controller
             $job->update(['cancel_requested' => true]);
             $refused = $job->refresh()->worker_job_id !== null ? $this->cancelOnWorker($job) : null;
             if ($refused !== null) {
-                return response()->json(['message' => __($refused)], 503);
+                return response()->json(['message' => Worker::say($refused)], 503);
             }
         }
 
@@ -176,7 +182,7 @@ class VideoJobController extends Controller
 
         $refused = $job->worker_job_id !== null ? $this->deleteOnWorker($job) : null;
         if ($refused !== null) {
-            return response()->json(['message' => __($refused)], 503);
+            return response()->json(['message' => Worker::say($refused)], 503);
         }
 
         $job->deleteFiles();
@@ -197,14 +203,20 @@ class VideoJobController extends Controller
     }
 
     /**
-     * Send a finished result for the page's player: kind "video" (the MP4, with range requests so
-     * the player can seek) or "vtt" (the subtitles as WebVTT). Only for the user who uploaded it.
+     * Send a video for a page's player: kind "video" (the dubbed MP4, with range requests so the
+     * player can seek), "vtt" (the subtitles as WebVTT) or "original" (the upload, for the review
+     * page). Only for the user who uploaded it.
      */
     public function preview(Request $request, VideoJob $job, string $kind): BinaryFileResponse|HttpResponse
     {
         $this->authorizeOwner($request, $job);
-        $path = $this->resultPath($job, $kind === 'vtt');
         $disk = Storage::disk('local');
+        if ($kind === 'original') {
+            abort_unless($disk->exists($job->path), 404, 'The uploaded video no longer exists.');
+
+            return response()->file($disk->path($job->path), ['Content-Type' => $disk->mimeType($job->path) ?: 'video/mp4']);
+        }
+        $path = $this->resultPath($job, $kind === 'vtt');
 
         return $kind === 'vtt'
             ? response(VideoJob::srtToVtt($disk->get($path)), 200, ['Content-Type' => 'text/vtt; charset=UTF-8'])
@@ -224,10 +236,10 @@ class VideoJobController extends Controller
         try {
             $response = Worker::client()->get("/jobs/{$job->worker_job_id}/segments");
         } catch (ConnectionException) {
-            return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => Worker::UNREACHABLE]);
+            return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => Worker::say(Worker::UNREACHABLE)]);
         }
         if (! $response->successful()) {
-            return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => $this->workerError($response)]);
+            return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => Worker::say($this->workerError($response))]);
         }
 
         return view('dub.review', ['job' => $job, 'segments' => $response->json('segments')]);
@@ -265,16 +277,21 @@ class VideoJobController extends Controller
                 $response = Worker::client()->put("/jobs/{$job->worker_job_id}/segments", ['segments' => $lines->values()->all(), ...$choices]);
             }
         } catch (ConnectionException) {
-            return back()->withInput()->withErrors(['review' => Worker::UNREACHABLE]);
+            return back()->withInput()->withErrors(['review' => Worker::say(Worker::UNREACHABLE)]);
         }
         if (! $response->successful()) {
-            return back()->withInput()->withErrors(['review' => $this->workerError($response)]);
+            return back()->withInput()->withErrors(['review' => Worker::say($this->workerError($response))]);
         }
 
+        $notice = match (true) {
+            (bool) $job->video_path => __('Saved. Making the new video…'),
+            (bool) $job->dub => __('Saved. Making the Khmer voice…'),
+            default => __('Saved. Making the subtitles…'),
+        };
         $job->update(['status' => VideoJob::QUEUED, 'progress' => 50, 'message' => 'Waiting in the queue', 'error' => null, 'cancel_requested' => false, ...$choices]);
         ProcessVideoJob::dispatch($job);
 
-        return redirect()->route('dub.index', ['job' => $job->id]);
+        return redirect()->route('dub.index', ['job' => $job->id])->with('notice', $notice);
     }
 
     /**
@@ -352,6 +369,8 @@ class VideoJobController extends Controller
             'dub' => $request->boolean('dub'),
             'review' => $request->boolean('review'),
             'original_volume' => (float) $request->input('original_volume', $user->dubOptions()['original_volume']),
+            // Sent only while dubbing, like the level, so the choice stays while dubbing is off.
+            'separate' => $request->has('original_volume') ? $request->boolean('separate') : $user->dubOptions()['separate'],
         ]])->save();
     }
 
@@ -407,10 +426,12 @@ class VideoJobController extends Controller
             'message' => $cancelling ? __('Cancelling') : ($job->message ? __($job->message) : null), // stored in English
             'step_done' => $cancelling ? null : $job->step_done,
             'step_total' => $cancelling ? null : $job->step_total,
-            'error' => $job->error ? __($job->error) : null, // known messages have Khmer
+            'ahead' => $cancelling ? null : $job->aheadInQueue(),
+            'error' => $job->error ? Worker::say($job->error) : null, // stored in English
             'language' => $job->language,
             'language_name' => $job->languageName(),
             'dub' => $job->dub,
+            'separate' => $job->separate && $job->original_volume > 0, // the worker skips it with the sound off
             'status_url' => route('dub.status', $job),
             'cancel_url' => $job->isRunning() && ! $cancelling && $job->progress < 99 ? route('dub.cancel', $job) : null, // at 99 only the download is left
             'cancel_keeps_edits' => $job->language !== null, // known once the Khmer is ready, so past any review

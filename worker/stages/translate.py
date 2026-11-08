@@ -2,11 +2,16 @@
 
 import functools
 import logging
+import os
+import re
+import shutil
 from collections.abc import Callable
+from pathlib import Path
 
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import ctranslate2
+from transformers import AutoTokenizer
 
+import config
 from stages import StageError, is_khmer
 
 log = logging.getLogger(__name__)
@@ -70,7 +75,7 @@ def translate(segments: list[dict], src_lang: str, on_step: Callable[[int, int],
     for start in range(0, len(todo), BATCH_SIZE):
         batch = todo[start:start + BATCH_SIZE]
         for seg, km in zip(batch, _translate_batch([seg["text"] for seg in batch], src_code), strict=True):
-            seg["km"] = km.strip()
+            seg["km"] = join_khmer_words(km.strip()) if config.KHMER_SPACES == "remove" else km.strip()
         if on_step:
             on_step(min(start + BATCH_SIZE, len(todo)), len(todo))
     if not any(is_khmer(seg["km"]) for seg in segments):
@@ -79,30 +84,62 @@ def translate(segments: list[dict], src_lang: str, on_step: Callable[[int, int],
     return segments
 
 
+# A Khmer letter or sign (U+1780 to U+17D3, and U+17DD), not punctuation (។ ៖ ...) or a digit.
+_BETWEEN_KHMER_WORDS = re.compile(r"(?<=[ក-៓៝]) +(?=[ក-៓៝])")
+
+
+def join_khmer_words(text: str) -> str:
+    """Remove the spaces NLLB puts between Khmer words, as Khmer is written without them.
+
+    Only a space with a Khmer letter on both sides goes, so the spaces next to punctuation,
+    digits and Latin words stay.
+    """
+    return _BETWEEN_KHMER_WORDS.sub("", text)
+
+
 def _translate_batch(texts: list[str], src_code: str) -> list[str]:
     """Translate one batch of texts from `src_code` to Khmer."""
     tokenizer, model = _load_model(MODEL_NAME)
     tokenizer.src_lang = src_code  # sets the language token the encoder sees
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_TOKENS)
-    with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            forced_bos_token_id=tokenizer.convert_tokens_to_ids(TARGET),
-            num_beams=4,
-            # Beam search alone loops on short or list-like lines ("Hello, how are you?" became
-            # "អ៊ូ! អ៊ូ! អ៊ូ! ..."); blocking repeated 3-grams and capping the length stops it.
-            no_repeat_ngram_size=3,
-            max_new_tokens=min(MAX_TOKENS, 3 * inputs["input_ids"].shape[1] + 10),
-        )
-    return tokenizer.batch_decode(output, skip_special_tokens=True)
+    source = [tokenizer.convert_ids_to_tokens(tokenizer.encode(text, truncation=True, max_length=MAX_TOKENS)) for text in texts]
+    results = model.translate_batch(
+        source,
+        target_prefix=[[TARGET]] * len(source),
+        beam_size=4,
+        # Beam search alone loops on short or list-like lines ("Hello, how are you?" became
+        # "អ៊ូ! អ៊ូ! អ៊ូ! ..."); blocking repeated 3-grams and capping the length stops it.
+        no_repeat_ngram_size=3,
+        max_decoding_length=min(MAX_TOKENS, 3 * max(map(len, source)) + 10),
+    )
+    # Each hypothesis starts with the target language token.
+    return [tokenizer.decode(tokenizer.convert_tokens_to_ids(result.hypotheses[0][1:]), skip_special_tokens=True)
+            for result in results]
+
+
+def _converted_path(name: str) -> Path:
+    """Where the CTranslate2 copy of model `name` is kept, next to the downloaded models."""
+    home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+    return home / "ctranslate2" / f"{name.strip('/').replace('/', '--')}-int8"
 
 
 @functools.cache
-def _load_model(name: str) -> tuple[AutoTokenizer, AutoModelForSeq2SeqLM]:
-    """Load the NLLB tokenizer and model once per process; the first call downloads them into HF_HOME."""
+def _load_model(name: str) -> tuple[AutoTokenizer, ctranslate2.Translator]:
+    """Load the NLLB tokenizer and model once per process.
+
+    The model runs in CTranslate2 with int8 weights, about 8 times faster on CPU than in
+    transformers and with almost the same output. The first call downloads the model into HF_HOME
+    and converts it there (about 30 s and 630 MB, once).
+    """
     try:
         tokenizer = AutoTokenizer.from_pretrained(name)
-        model = AutoModelForSeq2SeqLM.from_pretrained(name).eval()
+        converted = _converted_path(name)
+        if not (converted / "model.bin").exists():
+            log.info("Converting %s for CTranslate2 into %s (once)", name, converted)
+            partial = converted.with_name(converted.name + ".partial")  # never leave a half-written model in place
+            shutil.rmtree(partial, ignore_errors=True)
+            ctranslate2.converters.TransformersConverter(name).convert(str(partial), quantization="int8")
+            partial.rename(converted)
+        model = ctranslate2.Translator(str(converted), device="cpu", compute_type="int8")
     except Exception as exc:
         log.exception("Could not load translation model %r", name)
         raise StageError(

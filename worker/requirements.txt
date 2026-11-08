@@ -1,7 +1,7 @@
 # Pinned from the first successful build on 2026-10-30 (Python 3.14.10).
 # torch==2.15.0+cpu is installed separately in the Dockerfile from the CPU wheel index.
 # Direct dependencies: fastapi, uvicorn, python-multipart, faster-whisper, transformers,
-# sentencepiece, edge-tts, pydub, audioop-lts, pytest, httpx.
+# sentencepiece, edge-tts, pydub, audioop-lts, pytest, httpx, demucs (added 2026-11-08).
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.5
 aiosignal==1.4.0
@@ -14,7 +14,9 @@ av==19.0.2
 certifi==2026.10.23
 click==8.5.0
 ctranslate2==4.8.4
+demucs==4.1.0
 edge-tts==7.3.1
+einops==0.8.2
 fastapi==0.162.0
 faster-whisper==1.2.1
 filelock==4.2.4
@@ -23,14 +25,16 @@ frozenlist==1.8.0
 fsspec==2026.9.0
 h11==0.16.0
 hf-xet==1.8.0
-httpcore==1.0.9
 httpcore2==2.16.0
-httpx==0.28.1
+httpcore==1.0.9
 httpx2==2.16.0
+httpx==0.28.1
 huggingface_hub==2.4.0
 idna==3.20
 iniconfig==2.3.1
 Jinja2==3.1.6
+julius==0.2.8
+lameenc==1.9.0
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 mdurl==0.1.2
@@ -56,6 +60,7 @@ rich==15.0.0
 safetensors==0.8.0
 sentencepiece==0.2.2
 shellingham==1.5.4
+sphn==0.2.1
 starlette==1.10.0
 sympy==1.14.0
 tabulate==0.10.0

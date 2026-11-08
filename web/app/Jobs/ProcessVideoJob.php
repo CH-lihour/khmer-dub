@@ -147,6 +147,7 @@ class ProcessVideoJob implements ShouldQueue
                 ->post('/jobs', [
                     'gender' => $job->gender, 'dub' => $job->dub ? 'true' : 'false', 'review' => $job->review ? 'true' : 'false',
                     'original_volume' => (string) $job->original_volume,
+                    'language' => (string) $job->spoken_language, 'separate' => $job->separate ? 'true' : 'false',
                 ]);
         } finally {
             if (is_resource($stream)) {

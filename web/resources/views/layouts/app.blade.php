@@ -23,6 +23,33 @@
 <main>
     {{ $slot }}
 </main>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script>
+/** toast(text, kind): a short notice at the foot of the page that goes by itself. kind is 'ok' or 'bad'. */
+window.toast = (() => {
+    const box = document.getElementById('toasts');
+    const CLOSE = @json(__('Close'));
+    const hide = (item) => {
+        if (item.classList.contains('closing')) return;
+        item.classList.add('closing');
+        setTimeout(() => item.remove(), 200);
+    };
+    const toast = (text, kind = 'ok') => {
+        const item = Object.assign(document.createElement('p'), { className: `toast ${kind}` });
+        if (kind === 'bad') item.setAttribute('role', 'alert');
+        const close = Object.assign(document.createElement('button'), { type: 'button', className: 'toast-close', textContent: '×' });
+        close.setAttribute('aria-label', CLOSE);
+        close.addEventListener('click', () => hide(item));
+        item.append(Object.assign(document.createElement('span'), { textContent: text }), close);
+        box.append(item);
+        while (box.children.length > 3) box.firstElementChild.remove();
+        setTimeout(() => hide(item), kind === 'bad' ? 10000 : 6000);
+    };
+    const notice = @json(session('notice'));
+    if (notice) toast(notice);
+    return toast;
+})();
+</script>
 {{ $scripts ?? '' }}
 </body>
 </html>

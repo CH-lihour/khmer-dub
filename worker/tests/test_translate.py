@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+import config
 from stages import StageError, translate as translate_module
 from stages.translate import WHISPER_TO_NLLB, translate
 
@@ -68,6 +69,15 @@ def test_translates_in_batches_and_skips_empty_text(monkeypatch: pytest.MonkeyPa
     assert result[0]["km"] == "ក:line 0"
     assert result[3]["km"] == ""
     assert result[28]["km"] == "ក:line 28"
+
+
+def test_khmer_word_spaces_are_kept_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    nllb = "ខ្ញុំ ស្រឡាញ់ ភាសា ខ្មែរ។ តម្លៃ 5 ដុល្លារ ឬ ៥ NASA ជួយ!"
+    monkeypatch.setattr(translate_module, "_translate_batch", lambda texts, src_code: [nllb for _ in texts])
+
+    assert translate(segments("I love Khmer."), "en")[0]["km"] == nllb
+    monkeypatch.setattr(config, "KHMER_SPACES", "remove")
+    assert translate(segments("I love Khmer."), "en")[0]["km"] == "ខ្ញុំស្រឡាញ់ភាសាខ្មែរ។ តម្លៃ 5 ដុល្លារឬ ៥ NASA ជួយ!"
 
 
 def test_language_map_includes_required_codes() -> None:

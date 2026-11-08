@@ -28,7 +28,7 @@ Route::middleware('auth')->group(function () {
         Route::get('/dub/{job}/review', 'review')->name('dub.review');
         Route::post('/dub/{job}/review', 'saveReview')->name('dub.review.save');
         Route::get('/dub/{job}/download/{kind}', 'download')->whereIn('kind', ['srt', 'video'])->name('dub.download');
-        Route::get('/dub/{job}/preview/{kind}', 'preview')->whereIn('kind', ['vtt', 'video'])->name('dub.preview');
+        Route::get('/dub/{job}/preview/{kind}', 'preview')->whereIn('kind', ['vtt', 'video', 'original'])->name('dub.preview');
     });
 
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');

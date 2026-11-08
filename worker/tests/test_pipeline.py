@@ -21,7 +21,7 @@ def fake_stages(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("audio")
         return 60.0
 
-    def transcribe(wav_path: Path, on_step: Callable | None = None) -> tuple[list[dict], str]:
+    def transcribe(wav_path: Path, on_step: Callable | None = None, language: str | None = None) -> tuple[list[dict], str]:
         calls.append("transcribe")
         return [{"id": 0, "start": 1.0, "end": 2.5, "text": "Hello"}], "en"
 
@@ -49,7 +49,7 @@ def test_subtitles_only(fake_stages: list[str], tmp_path: Path) -> None:
 
 
 def test_stage_error_stops_the_run(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_speech(wav_path: Path, on_step: Callable | None = None) -> tuple[list[dict], str]:
+    def no_speech(wav_path: Path, on_step: Callable | None = None, language: str | None = None) -> tuple[list[dict], str]:
         raise StageError("No speech was found in the video.")
 
     monkeypatch.setattr(pipeline, "transcribe", no_speech)
@@ -69,7 +69,7 @@ def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.Mon
         fake_stages.append(f"track:{total_ms}")
         return folder / "dub.wav"
 
-    def merge(video: Path, dub_wav: Path, out: Path, original_volume: float | None = None) -> Path:
+    def merge(video: Path, dub_wav: Path, out: Path, original_volume: float | None = None, srt: Path | None = None, background: Path | None = None) -> Path:
         fake_stages.append(f"merge:{Path(dub_wav).name}:{original_volume}")
         return out
 
@@ -85,20 +85,65 @@ def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.Mon
     assert result["srt"].exists()
 
 
+def test_a_chosen_language_goes_to_whisper(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    heard: list = []
+
+    def transcribe(wav_path: Path, on_step: Callable | None = None, language: str | None = None) -> tuple[list[dict], str]:
+        heard.append(language)
+        return [{"id": 0, "start": 1.0, "end": 2.5, "text": "Bonjour"}], language or "en"
+
+    monkeypatch.setattr(pipeline, "transcribe", transcribe)
+    pipeline.run(tmp_path / "auto", "in.mp4", "male", False, lambda *a: None)
+    result = pipeline.run(tmp_path / "fr", "in.mp4", "male", False, lambda *a: None, language="fr")
+    assert heard == [None, "fr"]
+    assert result["language"] == "fr"
+
+
+def test_removing_the_speech_comes_before_the_mix_and_is_kept(
+        fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    separations: list[str] = []
+    mixed: list = []
+
+    def separate(video: Path, out: Path, on_step: Callable) -> Path:
+        separations.append(str(video))
+        on_step(30, 60)
+        Path(out).write_bytes(b"wav")
+        return Path(out)
+
+    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step=None: segments)
+    monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, volume, srt=None, background=None: mixed.append(background) or out)
+    monkeypatch.setattr(pipeline, "separate_speech", separate)
+    reports: list[tuple] = []
+    job = tmp_path / "job"
+    pipeline.run(job, "in.mp4", "male", True, lambda *a: reports.append(a), 0.8, separate=True)
+
+    assert separations == ["in.mp4"]
+    assert mixed == [job / "background.wav"]
+    steps = [r for r in reports if r[0] >= 85]
+    assert steps == [(85, "Removing the original speech"), (88, "Removing the original speech", 30, 60),
+                     (92, "Mixing and merging"), (100, "Done")]
+
+    pipeline.finish(job, "in.mp4", "male", True, 60.0, lambda *a: None, 0.8, separate=True)
+    assert separations == ["in.mp4"], "a second run reuses background.wav"
+    pipeline.finish(job, "in.mp4", "male", True, 60.0, lambda *a: None, 0.0, separate=True)
+    assert mixed[-1] is None, "with the original sound off nothing is separated or mixed in"
+
+
 def test_long_stages_report_how_far_they_are(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable) -> list[dict]:
         on_step(1, 4)
         on_step(4, 4)
         return segments
 
-    def transcribe(wav_path: Path, on_step: Callable) -> tuple[list[dict], str]:
+    def transcribe(wav_path: Path, on_step: Callable, language: str | None = None) -> tuple[list[dict], str]:
         on_step(30, 60)
         return [{"id": 0, "start": 1.0, "end": 2.5, "text": "Hello"}], "en"
 
     monkeypatch.setattr(pipeline, "transcribe", transcribe)
     monkeypatch.setattr(pipeline, "synth_all", synth_all)
     monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
-    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume, srt=None, background=None: out)
     reports: list[tuple] = []
 
     pipeline.run(tmp_path / "job", "in.mp4", "female", True, lambda *report: reports.append(report))
@@ -127,7 +172,7 @@ def test_making_a_job_again_forgets_the_voice_of_an_emptied_line(
 
     monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step: segments)
     monkeypatch.setattr(pipeline, "build_track", build_track)
-    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume, srt=None, background=None: out)
 
     pipeline.finish(job, "in.mp4", "female", True, 2.0, lambda p, m: None)
 
@@ -146,7 +191,7 @@ def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voic
 
     monkeypatch.setattr(pipeline, "synth_all", synth_all)
     monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
-    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume: out)
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume, srt=None, background=None: out)
     job = tmp_path / "job"
     milestones: list[int] = []
 
@@ -185,7 +230,7 @@ def test_real_video_dubbed(speech_video: Path, tmp_path: Path) -> None:
     except StageError as exc:
         pytest.skip(f"edge-tts unreachable: {exc}")
 
-    assert probe(result["video"], "-show_entries", "stream=codec_type,codec_name") == ["mpeg4,video", "aac,audio"]
+    assert probe(result["video"], "-show_entries", "stream=codec_type,codec_name") == ["mpeg4,video", "aac,audio", "mov_text,subtitle"]
     video_length, dubbed_length = (float(probe(p, "-show_entries", "format=duration")[0]) for p in (speech_video, result["video"]))
     assert dubbed_length == pytest.approx(video_length, abs=0.2)
     segments = json.loads((tmp_path / "job" / "segments.json").read_text(encoding="utf-8"))

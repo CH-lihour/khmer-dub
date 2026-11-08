@@ -178,7 +178,7 @@ class DubPageTest extends TestCase
         ], self::JSON)->assertCreated();
 
         $this->assertSame(
-            ['gender' => 'male', 'dub' => true, 'review' => true, 'original_volume' => 0.35],
+            ['gender' => 'male', 'dub' => true, 'review' => true, 'original_volume' => 0.35, 'separate' => false],
             $this->user->fresh()->dubOptions(),
         );
         $this->get('/dub')->assertOk()
@@ -296,9 +296,9 @@ class DubPageTest extends TestCase
 
         $this->getJson(route('dub.status', $job))->assertOk()->assertExactJson([
             'id' => $job->id, 'name' => 'talk.mp4', 'status' => 'processing', 'progress' => 45,
-            'message' => 'Translating to Khmer', 'step_done' => 12, 'step_total' => 29,
+            'message' => 'Translating to Khmer', 'step_done' => 12, 'step_total' => 29, 'ahead' => null,
             'error' => null, 'language' => null, 'language_name' => null,
-            'dub' => true, 'status_url' => route('dub.status', $job), 'review_url' => null, 'srt_url' => null, 'video_url' => null,
+            'dub' => true, 'separate' => false, 'status_url' => route('dub.status', $job), 'review_url' => null, 'srt_url' => null, 'video_url' => null,
             'edit_url' => null, 'preview_url' => null, 'subtitles_url' => null, 'cancel_url' => route('dub.cancel', $job), 'cancel_keeps_edits' => false, 'delete_url' => null,
         ]);
     }

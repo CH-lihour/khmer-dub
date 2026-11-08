@@ -150,8 +150,18 @@ html[lang=km] h1, html[lang=km] h2 { line-height: 1.5; letter-spacing: 0; }
     display: block; height: 100%; padding: .55rem .8rem; border: 2px solid var(--line); border-radius: 12px; background: var(--well);
     transition: border-color .2s ease, background-color .2s ease, box-shadow .2s ease, transform .15s ease;
 }
-.voices input + span { text-align: center; }
-.voices small { color: var(--ink-soft); font-size: .95rem; margin-left: .25rem; }
+.voices input + span { text-align: center; padding-inline: 2.4rem; }
+/* The sample button sits over the card, above the radio that covers the rest of it */
+.voices .listen {
+    position: absolute; z-index: 2; top: 50%; right: .45rem; transform: translateY(-50%);
+    width: 1.9rem; height: 1.9rem; padding: 0; border-radius: 50%; font-size: .7rem; line-height: 1;
+    background: var(--panel); color: var(--ink); box-shadow: none; border: 2px solid var(--line);
+}
+.voices .listen:hover { border-color: var(--lotus); transform: translateY(-50%); }
+.voices .listen:active { transform: translateY(-50%) scale(.92); }
+.voices .listen.playing { background: var(--lotus); color: var(--lotus-ink); border-color: var(--lotus); }
+.voices .listen:focus-visible { outline: 3px solid var(--lotus); outline-offset: 2px; }
+.voices small { display: block; color: var(--ink-soft); font-size: .95rem; } /* under the name in both cards, so they match */
 .voices input:hover + span { border-color: var(--ink-soft); box-shadow: 0 6px 16px rgb(42 30 107 / .22); transform: translateY(-2px); }
 .voices input:active + span { box-shadow: none; transform: scale(.98); }
 .voices input:checked + span { border-color: var(--lotus); background: var(--bad-bg); }
@@ -175,6 +185,12 @@ html[lang=km] h1, html[lang=km] h2 { line-height: 1.5; letter-spacing: 0; }
     display: grid; grid-template-columns: 1fr auto; gap: .2rem .75rem; align-items: center; margin: 0 0 .75rem; max-height: 5rem;
     transition: max-height .25s ease, margin-bottom .25s ease, opacity .2s ease, transform .25s ease, visibility 0s;
 }
+/* The spoken language, one row above the voices */
+.spoken { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .75rem; align-items: center; margin-bottom: 1rem; }
+.spoken label { margin: 0; font-weight: 600; }
+.spoken select { width: 100%; }
+.toggle .hint { display: block; font-weight: 400; font-size: .875rem; }
+.toggle.off { max-height: 0; margin-bottom: 0; overflow: hidden; opacity: 0; visibility: hidden; }
 .level.off { max-height: 0; margin-bottom: 0; overflow: hidden; opacity: 0; transform: translateY(-.4rem); visibility: hidden; transition-delay: 0s, 0s, 0s, 0s, .25s; }
 .level label { margin: 0; font-weight: 600; }
 .level output { color: var(--ink-soft); font-variant-numeric: tabular-nums; transition: color .15s ease; }
@@ -275,6 +291,22 @@ button.close:focus-visible { outline: 3px solid var(--lotus); outline-offset: 2p
 .modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: .75rem; margin-top: 1.25rem; }
 @keyframes fade { from { opacity: 0; } }
 
+/* Short notices after an action, at the foot of the page */
+.toasts {
+    position: fixed; z-index: 10; left: 50%; bottom: 1rem; transform: translateX(-50%);
+    width: min(30rem, calc(100vw - 2rem)); display: grid; gap: .5rem; pointer-events: none;
+}
+.toast {
+    display: flex; align-items: flex-start; gap: .75rem; margin: 0; padding: .7rem .7rem .7rem 1rem;
+    border: 2px solid var(--line); border-left: 6px solid var(--jade); border-radius: 16px;
+    background: var(--panel); color: var(--ink); box-shadow: var(--shadow); font-weight: 600;
+    overflow-wrap: anywhere; pointer-events: auto; animation: appear .25s ease both;
+}
+.toast.bad { border-left-color: var(--lotus); background: var(--bad-bg); }
+.toast span { flex: 1; }
+.toast.closing { animation: vanish .2s ease both; }
+.toast-close { flex: none; padding: 0 .5rem; font-size: 1.25rem; line-height: 1.4; background: none; color: var(--ink-soft); box-shadow: none; }
+
 /* Your videos */
 .videos { padding-top: 2rem; padding-bottom: 2rem; scroll-margin-top: 1rem; }
 .videos h2 { font-size: 1.4rem; }
@@ -320,8 +352,23 @@ tr.closing { animation: vanish .2s ease both; }
 .line label { font-weight: 400; margin: 0; }
 .line .hint { font-variant-numeric: tabular-nums; }
 .original { display: block; overflow-wrap: anywhere; }
+/* The review page's player stays in view while the lines scroll under it */
+.review-player { position: sticky; top: .5rem; z-index: 3; margin-top: 1.25rem; padding: .5rem; }
+.review-player video { display: block; width: 100%; max-height: 32vh; border-radius: 12px; background: #000; }
+.review-player .hint { margin: .5rem; }
+.play-line {
+    display: block; margin: 0 0 .25rem; padding: .1rem .55rem; border: 2px solid var(--line); border-radius: 99px;
+    background: none; color: var(--ink-soft); box-shadow: none; font-size: .875rem; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.play-line:hover { border-color: var(--lotus); color: var(--ink); transform: none; }
+.line.playing .play-line { border-color: var(--lotus); background: var(--lotus); color: var(--lotus-ink); }
+.line.playing textarea { border-color: var(--lotus); }
+.fit { margin: .3rem 0 0; font-size: .875rem; font-weight: 600; }
+.fit:empty { display: none; }
+.fit.fast { color: var(--ink-soft); }
+.fit.cut { color: var(--lotus); }
 .savebar {
-    position: sticky; bottom: 0; display: flex; gap: .75rem 1.25rem; align-items: center; flex-wrap: wrap; margin-top: 1rem; padding: .85rem 1.25rem;
+    position: sticky; bottom: 0; z-index: 4; display: flex; gap: .75rem 1.25rem; align-items: center; flex-wrap: wrap; margin-top: 1rem; padding: .85rem 1.25rem;
     background: var(--panel); border-radius: 24px 24px 0 0; box-shadow: 0 -6px 24px rgb(42 30 107 / .14);
 }
 

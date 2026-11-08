@@ -37,6 +37,22 @@ class VideoJob extends Model
 
     public const PROCESSING = 'processing';
 
+    /**
+     * Whisper codes of the languages the worker can translate to Khmer, and Khmer itself:
+     * WHISPER_TO_NLLB in worker/stages/translate.py. The worker refuses any other code.
+     */
+    public const SPOKEN_LANGUAGES = [
+        'af', 'am', 'ar', 'as', 'az', 'ba', 'be', 'bg', 'bn', 'bo', 'bs', 'ca', 'cs', 'cy', 'da', 'de', 'el', 'en', 'es',
+        'et', 'eu', 'fa', 'fi', 'fo', 'fr', 'gl', 'gu', 'ha', 'he', 'hi', 'hr', 'ht', 'hu', 'hy', 'id', 'is', 'it', 'ja',
+        'jw', 'ka', 'kk', 'km', 'kn', 'ko', 'lb', 'ln', 'lo', 'lt', 'lv', 'mg', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt',
+        'my', 'ne', 'nl', 'nn', 'no', 'oc', 'pa', 'pl', 'ps', 'pt', 'ro', 'ru', 'sa', 'sd', 'si', 'sk', 'sl', 'sn', 'so',
+        'sq', 'sr', 'su', 'sv', 'sw', 'ta', 'te', 'tg', 'th', 'tk', 'tl', 'tr', 'tt', 'uk', 'ur', 'uz', 'vi', 'yi', 'yo',
+        'yue', 'zh',
+    ];
+
+    /** Whisper codes that ICU knows by another code, for their names. */
+    private const ICU_CODES = ['jw' => 'jv'];
+
     /** Stopped after translation until a person has checked the Khmer. */
     public const REVIEW = 'review';
 
@@ -48,7 +64,7 @@ class VideoJob extends Model
 
     /** @var list<string> */
     protected $fillable = [
-        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'original_volume', 'status', 'progress',
+        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'original_volume', 'spoken_language', 'separate', 'status', 'progress',
         'message', 'step_done', 'step_total', 'language', 'worker_job_id', 'srt_path', 'video_path', 'error', 'cancel_requested',
     ];
 
@@ -58,6 +74,7 @@ class VideoJob extends Model
         'dub' => true,
         'review' => false,
         'original_volume' => 0,
+        'separate' => false,
         'status' => self::QUEUED,
         'progress' => 0,
         'cancel_requested' => false,
@@ -68,7 +85,7 @@ class VideoJob extends Model
      */
     protected function casts(): array
     {
-        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'progress' => 'integer', 'step_done' => 'integer', 'step_total' => 'integer', 'cancel_requested' => 'boolean'];
+        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'separate' => 'boolean', 'progress' => 'integer', 'step_done' => 'integer', 'step_total' => 'integer', 'cancel_requested' => 'boolean'];
     }
 
     /**
@@ -124,6 +141,26 @@ class VideoJob extends Model
     }
 
     /**
+     * For a waiting job, how many videos (anyone's) will be worked on before it; null otherwise.
+     *
+     * The queue and the worker take one video at a time, in the order they were queued. A waiting
+     * job is not touched until it starts, so its updated_at is when it was queued.
+     */
+    public function aheadInQueue(): ?int
+    {
+        if ($this->status !== self::QUEUED) {
+            return null;
+        }
+
+        return self::whereKeyNot($this->id)
+            ->where(fn ($ahead) => $ahead->where('status', self::PROCESSING)
+                ->orWhere(fn ($queued) => $queued->where('status', self::QUEUED)
+                    ->where(fn ($earlier) => $earlier->where('updated_at', '<', $this->updated_at)
+                        ->orWhere(fn ($tie) => $tie->where('updated_at', $this->updated_at)->where('id', '<', $this->id)))))
+            ->count();
+    }
+
+    /**
      * End a job that the queue has not started, in one step so the queue cannot start it meanwhile.
      * Returns false for any other job.
      */
@@ -167,12 +204,31 @@ class VideoJob extends Model
      */
     public function languageName(): ?string
     {
-        if ($this->language === null) {
-            return null;
-        }
-        $name = Locale::getDisplayLanguage($this->language, app()->getLocale());
+        return $this->language === null ? null : self::nameOf($this->language);
+    }
 
-        return $name !== '' && $name !== $this->language ? $name : $this->language;
+    /**
+     * A Whisper language code by name, in the page's language; the code itself if ICU has no name.
+     */
+    public static function nameOf(string $code): string
+    {
+        $name = Locale::getDisplayLanguage(self::ICU_CODES[$code] ?? $code, app()->getLocale());
+
+        return $name !== '' && $name !== $code ? $name : $code;
+    }
+
+    /**
+     * The languages a person can say a video is spoken in, code => name, sorted by name in the
+     * page's language.
+     *
+     * @return array<string, string>
+     */
+    public static function spokenLanguages(): array
+    {
+        $names = array_combine(self::SPOKEN_LANGUAGES, array_map(self::nameOf(...), self::SPOKEN_LANGUAGES));
+        (new \Collator(app()->getLocale()))->asort($names);
+
+        return $names;
     }
 
     /**

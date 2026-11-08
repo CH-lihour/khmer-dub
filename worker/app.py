@@ -46,6 +46,7 @@ import config
 import pipeline
 from stages import StageError, has_other_script_only
 from stages.audio import check_video, extract_audio
+from stages.translate import WHISPER_TO_NLLB
 from stages.tts import VOICES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -53,6 +54,7 @@ log = logging.getLogger("worker")
 
 FORMATS = (".mp4", ".mov", ".mkv", ".webm")
 DUB_VALUES = {"true": True, "1": True, "false": False, "0": False}
+SPOKEN_LANGUAGES = {*WHISPER_TO_NLLB, "km"}  # what a user may choose: languages NLLB-200 can translate, and Khmer
 PUBLIC_FIELDS = ("status", "progress", "message", "error", "language", "done", "total")
 JOB_ID = re.compile(r"[0-9a-f]{32}")
 WRONG_TOKEN = "Wrong or missing x-token. It must equal WORKER_TOKEN in worker/.env and DUBBER_TOKEN in web/.env."
@@ -108,11 +110,15 @@ class JobStore:
         return job_id, folder
 
     def submit(self, job_id: str, upload: str, gender: str, dub: bool, review: bool = False,
-               original_volume: float | None = None) -> None:
-        """Record a new job as queued and put it in line for the worker thread."""
+               original_volume: float | None = None, spoken: str | None = None, separate: bool = False) -> None:
+        """Record a new job as queued and put it in line for the worker thread.
+
+        `spoken` is the spoken language the user chose (None: detect it). "language" stays null
+        until the Khmer is ready, as the API contract says.
+        """
         job = {"status": "queued", "progress": 0, "message": "Waiting in the queue", "error": None,
                "language": None, "upload": upload, "gender": gender, "dub": dub, "review": review,
-               "original_volume": original_volume, "created": _now()}
+               "original_volume": original_volume, "spoken": spoken, "separate": separate, "created": _now()}
         with self._lock:
             self._jobs[job_id] = job
         self.update(job_id)
@@ -157,7 +163,7 @@ class JobStore:
                 raise HTTPException(409, NOT_IN_REVIEW)
             pipeline.save_segments(folder, segments)
             choices = {"gender": edits.gender, "original_volume": edits.original_volume}
-            self._set(job_id, status="queued", message="Waiting in the queue", error=None,
+            self._set(job_id, status="queued", message="Waiting in the queue", error=None, restarts=0,
                       **{key: value for key, value in choices.items() if value is not None})
         self._futures[job_id] = self._executor.submit(self._finish, job_id)
 
@@ -224,10 +230,14 @@ class JobStore:
 
         def work() -> None:
             if job.get("review"):
-                prepared = pipeline.prepare(folder, video, progress)
-                self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, done=None, total=None, **prepared)
+                prepared = pipeline.prepare(folder, video, progress, job.get("spoken"))
+                self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, done=None, total=None,
+                            restarts=0, **prepared)
             else:
-                result = pipeline.run(folder, video, job["gender"], job["dub"], progress, job.get("original_volume"))
+                # Translated before a restart: "prepared" lets it go on from the voice.
+                result = pipeline.run(folder, video, job["gender"], job["dub"], progress, job.get("original_volume"),
+                                      prepared=job.get("prepared"), on_prepared=lambda done: self.update(job_id, prepared=done),
+                                      language=job.get("spoken"), separate=job.get("separate", False))
                 self._done(job_id, job["upload"], result)
 
         self._attempt(job_id, work)
@@ -238,7 +248,7 @@ class JobStore:
 
         def work() -> None:
             result = pipeline.finish(folder, folder / job["upload"], job["gender"], job["dub"], job["duration"],
-                                     self._reporter(job_id), job.get("original_volume"))  # .get: older status.json
+                                     self._reporter(job_id), job.get("original_volume"), separate=job.get("separate", False))  # .get: older status.json
             self._done(job_id, job["upload"], {**result, "language": job["language"]})
 
         # A failure here (the voice service being down, say) must not lose the reviewer's work:
@@ -287,13 +297,14 @@ class JobStore:
         """Tidy the job's folder and record its results."""
         _tidy(self.work_dir / job_id, upload)
         video = Path(result["video"]).name if result["video"] else None
-        self.update(job_id, status="done", progress=100, message="Done", error=None, done=None, total=None,
+        self.update(job_id, status="done", progress=100, message="Done", error=None, done=None, total=None, restarts=0,
                     language=result["language"], srt=Path(result["srt"]).name, video=video)
         log.info("Job %s done", job_id)
 
     def _load(self) -> None:
-        """Read the status.json of every job folder; jobs a restart interrupted are marked failed."""
+        """Read the status.json of every job folder, and put the jobs a restart interrupted in line again."""
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        interrupted = []
         for status_file in self.work_dir.glob("*/status.json"):
             job_id = status_file.parent.name
             if not JOB_ID.fullmatch(job_id):
@@ -304,11 +315,32 @@ class JobStore:
                 log.warning("Skipping unreadable %s", status_file)
                 continue
             if self._jobs[job_id].get("status") in ("queued", "processing"):
-                if "duration" in self._jobs[job_id]:  # past its review: keep the reviewer's work
-                    self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, error=RESTARTED_REVIEW)
-                else:
-                    self.update(job_id, status="failed", message="Failed", error=RESTARTED)
+                interrupted.append(job_id)
+        for job_id in sorted(interrupted, key=lambda job_id: self._jobs[job_id].get("created", "")):
+            self._restart(job_id)
         log.info("Loaded %d jobs from %s", len(self._jobs), self.work_dir)
+
+    def _restart(self, job_id: str) -> None:
+        """Put a job the worker stopped in the middle of in line again, in its old place.
+
+        It goes on from the last saved step: the voice once the Khmer is ready, or the start. Only
+        once: a job running when the worker stopped twice may be what stops it (out of memory, say),
+        so it then fails, or waits in review again with the reviewer's work, as before.
+        """
+        job = self._jobs[job_id]
+        reviewed = "duration" in job  # past its review: keep the reviewer's work whatever happens
+        upload = job.get("upload")
+        if job.get("restarts", 0) >= 1 or not upload or not (self.work_dir / job_id / upload).is_file():
+            if reviewed:
+                self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, error=RESTARTED_REVIEW,
+                            done=None, total=None)
+            else:
+                self.update(job_id, status="failed", message="Failed", error=RESTARTED, done=None, total=None)
+            return
+        log.info("Job %s was interrupted by a restart; it goes on", job_id)
+        self.update(job_id, status="queued", message="Waiting in the queue", error=None, done=None, total=None,
+                    restarts=job.get("restarts", 0) + 1)
+        self._futures[job_id] = self._executor.submit(self._finish if reviewed else self._run, job_id)
 
 
 @asynccontextmanager
@@ -357,16 +389,25 @@ def create_job(
     dub: Annotated[str, Form()] = "true",
     review: Annotated[str, Form()] = "false",
     original_volume: Annotated[float | None, Form(ge=0, le=1)] = None,
+    language: Annotated[str, Form()] = "",
+    separate: Annotated[str, Form()] = "false",
 ) -> dict[str, str]:
     """Save the uploaded video, check it, queue it, and return {"job_id": "<hex>"}.
 
     `gender` is female or male (default female), `dub` is true or false (default true), and
     `review` is true to stop after translation so a person can edit the Khmer (default false).
     `original_volume` is how loud the original sound plays under the voice, 0 to 1 (default
-    ORIGINAL_VOLUME). Answers 422 with a clear `detail` for a missing file, an unsupported or unreadable format, a
-    video without sound or one longer than MAX_VIDEO_MINUTES.
+    ORIGINAL_VOLUME). `language` is the spoken language as a Whisper code (empty: detect it), and
+    `separate` is true to take the speech out of the original sound, keeping music and effects
+    (default false). Answers 422 with a clear `detail` for a missing file, an unsupported or
+    unreadable format, a video without sound or one longer than MAX_VIDEO_MINUTES.
     """
     gender, dub, review = gender.strip().lower(), dub.strip().lower(), review.strip().lower()
+    language, separate = language.strip().lower(), separate.strip().lower()
+    if language and language not in SPOKEN_LANGUAGES:
+        raise HTTPException(422, "language must be a Whisper language code that can be translated to Khmer, or empty.")
+    if separate not in DUB_VALUES:
+        raise HTTPException(422, "separate must be true or false.")
     if file is None or not file.filename:
         raise HTTPException(422, "No video was sent. Attach it as the multipart field 'file'.")
     extension = Path(file.filename).suffix.lower()
@@ -395,7 +436,8 @@ def create_job(
         raise HTTPException(500, "The worker could not save the video. Check its free disk space.") from exc
 
     log.info("Job %s queued: %s, %.1f MB", job_id, extension, upload.stat().st_size / 1e6)
-    jobs.submit(job_id, upload.name, gender, DUB_VALUES[dub], DUB_VALUES[review], original_volume)  # it may delete the upload from here on
+    jobs.submit(job_id, upload.name, gender, DUB_VALUES[dub], DUB_VALUES[review], original_volume,
+                language or None, DUB_VALUES[separate])  # it may delete the upload from here on
     return {"job_id": job_id}
 
 

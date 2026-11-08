@@ -106,7 +106,8 @@ class ReviewPageTest extends TestCase
         $job = $this->waiting(['error' => 'An earlier failure.']);
 
         $this->post(route('dub.review.save', $job), ['km' => [0 => 'ជំរាបសួរ', 1 => '']])
-            ->assertRedirect(route('dub.index', ['job' => $job->id]));
+            ->assertRedirect(route('dub.index', ['job' => $job->id]))
+            ->assertSessionHas('notice', 'Saved. Making the Khmer voice…');
 
         Http::assertSent(fn (Request $request) => $request->method() === 'PUT'
             && $request->url() === 'http://worker.test/jobs/w1/segments'
@@ -151,7 +152,8 @@ class ReviewPageTest extends TestCase
         $job = $this->finished(['error' => 'An earlier failure.']);
 
         $this->post(route('dub.review.save', $job), ['km' => [0 => 'ថ្មី'], 'gender' => 'male', 'original_volume' => '0.4'])
-            ->assertRedirect(route('dub.index', ['job' => $job->id]));
+            ->assertRedirect(route('dub.index', ['job' => $job->id]))
+            ->assertSessionHas('notice', 'Saved. Making the new video…');
 
         $sent = Http::recorded()->map(fn (array $pair) => $pair[0]);
         $this->assertSame(
@@ -290,6 +292,33 @@ class ReviewPageTest extends TestCase
 
         Http::assertNothingSent();
         Queue::assertNothingPushed();
+    }
+
+    public function test_the_review_page_plays_the_upload_line_by_line(): void
+    {
+        Http::fake(['worker.test/jobs/w1/segments' => Http::response(['segments' => [
+            ['id' => 0, 'start' => 1.0, 'end' => 2.5, 'text' => 'Hello', 'km' => 'សួស្តី'],
+            ['id' => 1, 'start' => 3.0, 'end' => 4.0, 'text' => 'Bye', 'km' => 'លាហើយ'],
+        ]])]);
+        $job = $this->waiting();
+
+        $this->get(route('dub.review', $job))->assertOk()
+            ->assertSee('src="'.route('dub.preview', [$job, 'original']).'"', false)
+            ->assertSee('data-start="1" data-end="2.5" data-next="3"', false)
+            ->assertSee('data-start="3" data-end="4" data-next=""', false)
+            ->assertSee('▶ 0:01 – 0:02');
+    }
+
+    public function test_the_upload_can_be_played_only_by_its_owner(): void
+    {
+        Storage::disk('local')->put('uploads/abc.mp4', 'video bytes');
+        $job = $this->waiting();
+
+        $response = $this->get(route('dub.preview', [$job, 'original']))->assertOk();
+        $this->assertSame('video bytes', file_get_contents($response->baseResponse->getFile()->getPathname()));
+        $this->get(route('dub.preview', [$this->waiting([], User::factory()->create()), 'original']))->assertForbidden();
+        Storage::disk('local')->delete('uploads/abc.mp4');
+        $this->get(route('dub.preview', [$job, 'original']))->assertNotFound();
     }
 
     public function test_guests_are_sent_to_the_login_page(): void

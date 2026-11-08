@@ -21,8 +21,11 @@
         <!-- Compose passes web/.env as real environment variables (APP_ENV=local, DB_CONNECTION=mysql).
              PHPUnit keeps those unless force="true", and Laravel reads $_SERVER before $_ENV, so each
              setting is forced in both. Otherwise RefreshDatabase would wipe the development database.
-             tests/TestCase.php also refuses to run on anything but in-memory SQLite. -->
+             tests/TestCase.php also refuses to run on anything but in-memory SQLite.
+             APP_KEY: a key for tests only. The container's own APP_KEY is empty until it is recreated
+             after the first start wrote the key to web/.env, and `docker compose exec` sees that. -->
         <server name="APP_ENV" value="testing"/>
+        <server name="APP_KEY" value="base64:9lPMwfZdZM3+aAFhOT3dLliSWiFgzoErtm48Ics0VMM="/>
         <server name="APP_MAINTENANCE_DRIVER" value="file"/>
         <server name="BCRYPT_ROUNDS" value="4"/>
         <server name="BROADCAST_CONNECTION" value="null"/>
@@ -34,6 +37,7 @@
         <server name="QUEUE_CONNECTION" value="sync"/>
         <server name="SESSION_DRIVER" value="array"/>
         <env name="APP_ENV" value="testing" force="true"/>
+        <env name="APP_KEY" value="base64:9lPMwfZdZM3+aAFhOT3dLliSWiFgzoErtm48Ics0VMM=" force="true"/>
         <env name="APP_MAINTENANCE_DRIVER" value="file" force="true"/>
         <env name="BCRYPT_ROUNDS" value="4" force="true"/>
         <env name="BROADCAST_CONNECTION" value="null" force="true"/>

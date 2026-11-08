@@ -34,9 +34,10 @@ Use exactly these tools. Do not substitute without asking the developer.
 | AI worker | Latest stable Python (3.14, or 3.13 if a package has no 3.14 build), latest FastAPI, Uvicorn, in Docker | One worker thread, jobs run one at a time |
 | Audio and video | FFmpeg, pydub | Installed in the worker image with apt |
 | Speech-to-text | faster-whisper | Model `small` by default, `medium` if the machine allows |
-| Translation to Khmer | NLLB-200 distilled 600M (`facebook/nllb-200-distilled-600M`) via Hugging Face `transformers` | Free, local, Khmer code `khm_Khmr` |
+| Translation to Khmer | NLLB-200 distilled 600M (`facebook/nllb-200-distilled-600M`) via Hugging Face `transformers`, run in CTranslate2 with int8 weights (converted once into `HF_HOME`) | Free, local, Khmer code `khm_Khmr` |
 | Khmer voice (main) | `edge-tts`, voices `km-KH-SreymomNeural` and `km-KH-PisethNeural` | Free but needs internet and is unofficial; isolate it behind one function |
 | Khmer voice (offline fallback) | `facebook/mms-tts-khm` via `transformers` | Robotic but fully local; switch with an env flag |
+| Remove the original speech (optional) | Demucs `htdemucs` (MIT) | Local; only with `separate=true`; about half the video length on CPU |
 
 **Environment variables (Python `.env`)**
 
@@ -48,6 +49,7 @@ TTS_ENGINE=edge           # edge | mms
 WORK_DIR=/data/jobs
 MAX_VIDEO_MINUTES=15
 ORIGINAL_VOLUME=0.15      # default for POST /jobs without original_volume, 0 to 1; the site always sends it
+KHMER_SPACES=keep         # keep | remove the spaces NLLB puts between Khmer words
 ```
 
 **Laravel `.env` additions**
@@ -127,6 +129,7 @@ Everything runs in containers. The developer needs only Git and Docker (Docker E
 | `scheduler` | same image as `web` | `php artisan schedule:work` (runs `dub:cleanup` daily) | none |
 | `mysql` | official `mysql` image, latest LTS tag | database | none |
 | `worker` | official `python` slim image (3.14, or 3.13 if needed) plus FFmpeg | FastAPI worker | none |
+| `mailpit` | `axllent/mailpit` (MIT) | catches the site's email (password reset links) | 8025 on 127.0.0.1 only |
 
 **Rules**
 
@@ -162,7 +165,7 @@ Both apps must follow this contract exactly. Every request to the worker carries
 
 | Method and path | Sends | Returns |
 | --- | --- | --- |
-| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`), `original_volume` (0 to 1, how loud the original sound plays under the Khmer voice; 0 = off, default `ORIGINAL_VOLUME`) | `{"job_id": "<hex>"}` |
+| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`), `original_volume` (0 to 1, how loud the original sound plays under the Khmer voice; 0 = off, default `ORIGINAL_VOLUME`), `language` (the spoken language as a Whisper code; empty or left out = detect it), `separate` (`true` or `false`, default `false`: take the speech out of the original sound, keeping music and effects) | `{"job_id": "<hex>"}` |
 | `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language", "done", "total"}` |
 | `GET /jobs/{id}/segments` | nothing | `{"segments": [{"id", "start", "end", "text", "km"}]}` while the job is in `review` or `done` |
 | `PUT /jobs/{id}/segments` | JSON: `{"segments": [{"id", "km"}]}`, optional `gender` and `original_volume` | `{"status": "queued"}` after saving the Khmer and choices and resuming the job; lines left out keep their text, choices left out stay, and an empty line is dropped |
@@ -175,9 +178,9 @@ Both apps must follow this contract exactly. Every request to the worker carries
 
 **Status values**: `queued`, `processing`, `review`, `done`, `failed`, `cancelled`. `review` means a job sent with `review=true` has stopped after translation, or a finished job was reopened, until its Khmer is saved; it holds no worker thread. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the Khmer is ready (`review` or `done`); Laravel stores it in `video_jobs.language`.
 
-**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge, 100 done. Inside the long steps the progress moves on, and `done` and `total` say how far the step is: seconds of the video while transcribing, lines while translating or making the voice. Otherwise they are null.
+**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge (with `separate=true`: 85 remove the original speech, 92 mix and merge), 100 done. Inside the long steps the progress moves on, and `done` and `total` say how far the step is: seconds of the video while transcribing or removing the speech, lines while translating or making the voice. Otherwise they are null.
 
-**Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 409 for a review call on a job that is not in review, a reopen of a job that cannot be edited, a cancel of a job that is not queued or running, or a delete of one that is, 422 for bad input. A failure or restart after the review sends the job back to `review` with `error` set, so the edits are kept and saving retries it. A job cancelled after its review also goes back to `review`, without an error.
+**Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 409 for a review call on a job that is not in review, a reopen of a job that cannot be edited, a cancel of a job that is not queued or running, or a delete of one that is, 422 for bad input. A restart puts a queued or running job back in line once, in its old order, going on from its last saved step (the voice once the Khmer is ready). A failure after the review, or a second restart of the same run, sends the job back to `review` with `error` set, so the edits are kept and saving retries it; before the review it fails. A job cancelled after its review also goes back to `review`, without an error.
 
 ## FastAPI worker specification
 
@@ -206,7 +209,7 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 - Keep a dictionary that maps Whisper language codes to NLLB codes (for example `en` to `eng_Latn`, `zh` to `zho_Hans`, `th` to `tha_Thai`, `ja` to `jpn_Jpan`, `ko` to `kor_Hang`, `fr` to `fra_Latn`, `vi` to `vie_Latn`). Raise a clear error for an unmapped language.
 - If the source language is already Khmer (`km`), copy `text` into `km` and skip the model, but only for lines written in Khmer letters. Raise a clear error if none are.
 - Raise a clear error if no translated line contains Khmer letters.
-- Translate in batches of 8 to 16 segments to save time. Load the model once.
+- Translate in batches of 8 to 16 segments to save time. Load the model once. Remove the spaces between Khmer words only with `KHMER_SPACES=remove`.
 - Never call any online translation service.
 
 **Stage 4: `tts.py`**
@@ -220,7 +223,7 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 
 - `build_track(segments, total_ms, folder)` makes a silent track the length of the video and overlays each clip at its `start` time.
 - Only speed clips up, never slow them. Use FFmpeg `atempo` with a maximum factor of 1.6 (`MAX_SPEED`). Allow a clip to run into the silence after its slot, but never past the next segment's start. Speed it up only when it does not fit before the next segment.
-- `merge(video, dub_wav, out)` uses `-c:v copy` and AAC audio, so the video is not re-encoded. The original sound plays under the Khmer voice at the job's `original_volume`, fixed for the whole video.
+- `merge(video, dub_wav, out)` uses `-c:v copy` and AAC audio, so the video is not re-encoded. The original sound plays under the Khmer voice at the job's `original_volume`, fixed for the whole video, or with `separate` the sound without its speech (kept as `background.wav` for the next run). The Khmer subtitles go in as an MP4 text track that players can switch on.
 - `write_srt(segments, path)` writes UTF-8 SRT with the Khmer text and the original timestamps.
 
 **`pipeline.py`**
@@ -248,6 +251,8 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `dub` | boolean | default true |
 | `review` | boolean | default false; stop for a person to edit the Khmer |
 | `original_volume` | decimal(3,2) | default 0; original sound under the voice, 0 (off) to 1 |
+| `spoken_language` | string, nullable | the spoken language chosen on the form, a Whisper code; null = detect it |
+| `separate` | boolean | default false; take the original speech out of the sound under the voice |
 | `status` | string | `queued`, `processing`, `review`, `done`, `failed`, `cancelled` |
 | `progress` | tinyint | 0 to 100 |
 | `message` | string, nullable | current step text |
@@ -258,7 +263,7 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `error` | text, nullable | failure reason |
 | `cancel_requested` | boolean | default false; a person asked to stop the job and the worker has not stopped yet |
 
-`users` also has `dub_options` (JSON, nullable): the user's latest choices on the upload form (`gender`, `dub`, `review`, `original_volume`), saved as soon as one changes. The form starts from them. They stay after cleanup deletes the user's jobs.
+`users` also has `dub_options` (JSON, nullable): the user's latest choices on the upload form (`gender`, `dub`, `review`, `original_volume`, `separate`), saved as soon as one changes. The form starts from them. They stay after cleanup deletes the user's jobs.
 
 **Files and responsibilities**
 

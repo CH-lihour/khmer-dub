@@ -26,8 +26,11 @@ SENTENCE_END = re.compile(r"[.!?…。！？។៕][\"'”’)\]»]*$")
 CLAUSE_MARKS = ",;:，、；：-–—"  # a line ending in one of these goes on in the next line
 
 
-def transcribe(wav_path: str | Path, on_step: Callable[[int, int], None] | None = None) -> tuple[list[dict], str]:
-    """Transcribe a 16 kHz WAV and return its timed segments and the detected language code (e.g. "en").
+def transcribe(wav_path: str | Path, on_step: Callable[[int, int], None] | None = None,
+               language: str | None = None) -> tuple[list[dict], str]:
+    """Transcribe a 16 kHz WAV and return its timed segments and the language code (e.g. "en").
+
+    `language` is the spoken language as a Whisper code when the user chose it; None detects it.
 
     Each segment is {"id", "start", "end", "text"}, with times in seconds from the start of the
     video. Silence is skipped with the VAD filter and empty segments are dropped. Whisper's
@@ -39,7 +42,7 @@ def transcribe(wav_path: str | Path, on_step: Callable[[int, int], None] | None 
     audio = _read_wav(Path(wav_path))
     model = _load_model(config.WHISPER_MODEL, config.WHISPER_DEVICE)
     # Word timestamps make Whisper fit each segment's edges to its first and last word.
-    pieces, info = model.transcribe(audio, vad_filter=True, word_timestamps=True)
+    pieces, info = model.transcribe(audio, vad_filter=True, word_timestamps=True, language=language or None)
 
     segments: list[dict] = []
     total = int(info.duration)

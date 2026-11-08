@@ -79,6 +79,34 @@ def test_merge_copies_the_picture(tone_video: Path, tmp_path: Path) -> None:
     assert probe(out, *same_packets) == probe(tone_video, *same_packets), "the video was re-encoded"
 
 
+def test_merge_puts_the_khmer_subtitles_in_the_mp4(tone_video: Path, tmp_path: Path) -> None:
+    srt = tmp_path / "khmer.srt"
+    write_srt([{"id": 0, "start": 0.2, "end": 1.4, "km": "សួស្តី"}], srt)
+    out = merge(tone_video, tone(tmp_path / "dub.wav", 2.0), tmp_path / "dubbed.mp4", srt=srt)
+
+    assert probe(out, "-show_entries", "stream=codec_type,codec_name") == ["mpeg4,video", "aac,audio", "mov_text,subtitle"]
+    assert probe(out, "-select_streams", "s", "-show_entries", "stream_tags=language") == ["khm"]
+    text = tmp_path / "back.srt"
+    ffmpeg("-i", str(out), "-map", "0:s:0", str(text))
+    assert "សួស្តី" in text.read_text(encoding="utf-8")
+    same_packets = ["-select_streams", "v", "-show_entries", "packet=data_hash", "-show_data_hash", "MD5"]
+    assert probe(out, *same_packets) == probe(tone_video, *same_packets), "the video was re-encoded"
+
+
+def test_merge_plays_the_background_instead_of_the_original_sound(
+        tone_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "ORIGINAL_VOLUME", 1.0)
+    dub = silence(tmp_path / "dub.wav", 2.0)
+    quiet = merged_sound(merge(tone_video, dub, tmp_path / "quiet.mp4", background=silence(tmp_path / "bg.wav", 2.0)), tmp_path)
+    assert loudness(quiet, 0.2, 1.8) < 1, "the original tone came through"
+
+    srt = tmp_path / "khmer.srt"
+    write_srt([{"id": 0, "start": 0.2, "end": 1.4, "km": "សួស្តី"}], srt)
+    out = merge(tone_video, dub, tmp_path / "music.mp4", srt=srt, background=tone(tmp_path / "music.wav", 2.0))
+    assert loudness(merged_sound(out, tmp_path), 0.2, 1.8) > 1000
+    assert probe(out, "-show_entries", "stream=codec_type") == ["video", "audio", "subtitle"]
+
+
 def merged_sound(mp4: Path, tmp_path: Path) -> np.ndarray:
     """Decode the sound of an MP4 to mono 24 kHz samples."""
     wav = tmp_path / "decoded.wav"

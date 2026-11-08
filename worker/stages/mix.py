@@ -64,17 +64,28 @@ def build_track(segments: list[dict], total_ms: int, folder: str | Path) -> Path
     return out
 
 
-def merge(video: str | Path, dub_wav: str | Path, out: str | Path, original_volume: float | None = None) -> Path:
+def merge(video: str | Path, dub_wav: str | Path, out: str | Path, original_volume: float | None = None,
+          srt: str | Path | None = None, background: str | Path | None = None) -> Path:
     """Write an MP4 with the video's picture, and the Khmer track over the quiet original sound; return its path.
 
     The picture is copied as is (-c:v copy). Only when MP4 cannot hold the video codec (VP8 from
     WebM, for example) is it re-encoded to H.264. The original sound plays at `original_volume` all
     the way through (0 leaves only the Khmer track; None uses ORIGINAL_VOLUME). The sound is AAC,
-    labelled as an AI-generated voice.
+    labelled as an AI-generated voice. With `srt`, the Khmer subtitles go in too, as a subtitle
+    track that players can switch on (MP4 text, not drawn into the picture). With `background` (a
+    WAV of the original sound without its speech, from stages/separate.py), that plays under the
+    voice at `original_volume` instead of the original sound.
     """
     out = Path(out)
     volume = config.ORIGINAL_VOLUME if original_volume is None else original_volume
-    inputs = ["-i", str(video), "-i", str(dub_wav), "-map", "0:v:0", *_sound_args(video, volume)]
+    # Every -i comes before the first -map: 0 video, 1 Khmer track, then the background and the subtitles.
+    extra = [path for path in (background, srt) if path]
+    bg_index = 2 if background else None
+    srt_index = 2 + bool(background)
+    subtitles = ["-map", f"{srt_index}:s:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=khm",
+                 "-metadata:s:s:0", "title=Khmer"] if srt else []
+    inputs = ["-i", str(video), "-i", str(dub_wav), *(arg for path in extra for arg in ("-i", str(path))),
+              "-map", "0:v:0", *_sound_args(video, volume, bg_index), *subtitles]
     audio = ["-c:a", "aac", "-b:a", "160k", "-metadata:s:a:0", "language=khm",
              "-metadata:s:a:0", "title=Khmer (AI-generated voice)",
              "-metadata", "comment=Dubbed into Khmer with an AI-generated voice", "-movflags", "+faststart", str(out)]
@@ -110,16 +121,18 @@ def write_srt(segments: list[dict], path: str | Path) -> int:
     return len(cues)
 
 
-def _sound_args(video: str | Path, volume: float) -> list[str]:
+def _sound_args(video: str | Path, volume: float, background: int | None = None) -> list[str]:
     """FFmpeg arguments that pick the sound: the Khmer track, mixed over the quieted original if there is one.
 
+    The original is the video's sound, or input number `background` when the speech was taken out.
     The volume stays fixed instead of rising between lines, so the original speech never comes back
     loudly when a Khmer line ends early. The limiter stops the mix from clipping on loud moments.
     """
-    if volume <= 0 or not _has_sound(video):
+    if volume <= 0 or (background is None and not _has_sound(video)):
         return ["-map", "1:a:0"]
+    source = f"[{background}:a:0]" if background is not None else "[0:a:0]"
     # rematrix_maxval=1 averages stereo into mono; without it the channels add up, 3 dB too loud.
-    mix = (f"[0:a:0]aresample={TRACK_RATE}:ochl=mono:rematrix_maxval=1,volume={volume}[original];"
+    mix = (f"{source}aresample={TRACK_RATE}:ochl=mono:rematrix_maxval=1,volume={volume}[original];"
            "[1:a:0][original]amix=inputs=2:duration=first:normalize=0,"
            "alimiter=limit=0.97:level=false:latency=true[sound]")
     return ["-filter_complex", mix, "-map", "[sound]"]

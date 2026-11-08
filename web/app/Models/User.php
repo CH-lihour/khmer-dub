@@ -19,7 +19,7 @@ class User extends Authenticatable
     use HasFactory, Notifiable;
 
     /** The upload form's choices until a user has made their own. */
-    public const DUB_DEFAULTS = ['gender' => 'female', 'dub' => true, 'review' => false, 'original_volume' => 0.0];
+    public const DUB_DEFAULTS = ['gender' => 'female', 'dub' => true, 'review' => false, 'original_volume' => 0.0, 'separate' => false];
 
     /**
      * Get the attributes that should be cast.
