@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Exceptions\DubbingFailed;
+use App\Models\TranslationMemory;
 use App\Models\VideoJob;
 use App\Support\Worker;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -131,6 +132,24 @@ class ProcessVideoJob implements ShouldQueue
     }
 
     /**
+     * The owner's glossary and newest remembered edits, as the JSON fields of POST /jobs.
+     *
+     * @return array{glossary: string, memory: string}
+     */
+    private function terms(VideoJob $job): array
+    {
+        $owner = $job->user;
+        $memory = $owner?->translationMemories()->latest('updated_at')->limit(TranslationMemory::SENT)
+            ->get(['language', 'source', 'km'])
+            ->reverse() // the worker keeps the last one where two lines match
+            ->map(fn (TranslationMemory $line) => ['language' => $line->language, 'text' => $line->source, 'km' => $line->km])
+            ->values()->all() ?? [];
+        $flags = JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
+
+        return ['glossary' => json_encode($owner?->glossaryEntries() ?? [], $flags), 'memory' => json_encode($memory, $flags)];
+    }
+
+    /**
      * Send the upload to POST /jobs and return the worker's job id.
      */
     private function submit(VideoJob $job): string
@@ -148,6 +167,8 @@ class ProcessVideoJob implements ShouldQueue
                     'gender' => $job->gender, 'dub' => $job->dub ? 'true' : 'false', 'review' => $job->review ? 'true' : 'false',
                     'original_volume' => (string) $job->original_volume,
                     'language' => (string) $job->spoken_language, 'separate' => $job->separate ? 'true' : 'false',
+                    'speakers' => $job->speakers ? 'true' : 'false',
+                    ...$this->terms($job),
                 ]);
         } finally {
             if (is_resource($stream)) {

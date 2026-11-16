@@ -1,0 +1,12 @@
+# HTTPS in front of the Laravel site. Caddy gets and renews a free Let's Encrypt certificate for
+# SITE_ADDRESS by itself (ports 80 and 443 must be open). Set SITE_ADDRESS in the root .env file.
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# Uploads up to the site's 500 MB limit.
+	request_body {
+		max_size 520MB
+	}
+
+	reverse_proxy web:8000
+}

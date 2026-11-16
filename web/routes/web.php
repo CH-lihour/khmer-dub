@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\GlossaryController;
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\VideoJobController;
 use App\Http\Middleware\SetLanguage;
@@ -27,9 +28,15 @@ Route::middleware('auth')->group(function () {
         Route::delete('/dub/{job}', 'destroy')->name('dub.destroy');
         Route::get('/dub/{job}/review', 'review')->name('dub.review');
         Route::post('/dub/{job}/review', 'saveReview')->name('dub.review.save');
+        // Each click asks the voice service for a line, so a held-down key cannot flood it.
+        Route::post('/dub/{job}/voice', 'voice')->middleware('throttle:30,1')->name('dub.voice');
         Route::get('/dub/{job}/download/{kind}', 'download')->whereIn('kind', ['srt', 'video'])->name('dub.download');
         Route::get('/dub/{job}/preview/{kind}', 'preview')->whereIn('kind', ['vtt', 'video', 'original'])->name('dub.preview');
     });
+
+    Route::get('/glossary', [GlossaryController::class, 'edit'])->name('glossary.edit');
+    Route::put('/glossary', [GlossaryController::class, 'update'])->name('glossary.update');
+    Route::delete('/glossary/memory', [GlossaryController::class, 'forget'])->name('glossary.forget');
 
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');

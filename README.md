@@ -123,6 +123,9 @@ To check the subtitles in VLC:
 segment's times with the original and Khmer text, for debugging and review.
 
 ```bash
+# Phase 8: print who speaks each line (without a video: a sample of three English voices, needs internet)
+docker compose run --rm worker python try_speakers.py [samples/test.mp4]
+
 # Phase 4: also make worker/samples/test-out/dubbed.mp4 with a Khmer voice (female or male)
 docker compose run --rm worker python try_pipeline.py samples/test.mp4 --dub --voice female
 ```
@@ -133,7 +136,7 @@ cut, and any clip that overlaps the next segment (there should be none).
 How the voice is made and fitted:
 
 - `TTS_ENGINE=edge` (default) uses edge-tts with `km-KH-SreymomNeural` (female) or
-  `km-KH-PisethNeural` (male). It needs internet and is retried twice. `TTS_ENGINE=mms` uses
+  `km-KH-PisethNeural` (male). It needs internet and is retried twice after a network error (a "no audio" answer up to 10 times). `TTS_ENGINE=mms` uses
   `facebook/mms-tts-khm` offline (one voice, about 145 MB on the first run).
 - Each clip becomes WAV 24 kHz mono, and the silence around the speech is cut (edge-tts adds
   about 0.2 s before and 0.8 s after).
@@ -181,13 +184,14 @@ needs the header `x-token` equal to `WORKER_TOKEN` (worker/.env), which must equ
 
 | Call | Answer |
 | --- | --- |
-| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`, `language` = a Whisper code or empty to detect it, `separate` = `true`/`false`) | `{"job_id": "<32 hex>"}` |
+| `POST /jobs` (multipart `file`, `gender` = `female`/`male`, `dub` = `true`/`false`, `review` = `true`/`false`, `original_volume` = `0` to `1`, `language` = a Whisper code or empty to detect it, `separate` = `true`/`false`, `speakers` = `true`/`false`, `glossary` = JSON `[{"term", "km"}]`, `memory` = JSON `[{"language", "text", "km"}]`) | `{"job_id": "<32 hex>"}` |
 | `GET /jobs/{id}` | `{"status", "progress", "message", "error", "language", "done", "total"}` |
-| `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km"}]}`, while in `review` or `done` |
+| `GET /jobs/{id}/segments` | `{"segments": [{"id", "start", "end", "text", "km", "speaker", "reused"}], "speakers": [{"id", "gender", "lines"}]}`, while in `review` or `done` |
+| `POST /jobs/{id}/voice` (JSON `{"text"}`, optional `gender`, `speaker`, `speakers`) | one line's Khmer voice as WAV, header `x-clip-seconds` |
 | `POST /jobs/{id}/reopen` (multipart `file`, the original video) | `{"status": "review"}`, to make a done job's results again |
 | `POST /jobs/{id}/cancel` | `{"status": <status now>}`, to stop a queued or running job |
 | `DELETE /jobs/{id}` | `{"status": "deleted"}`, to delete a stopped job and its folder |
-| `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km"}]}`, optional `gender`, `original_volume`) | `{"status": "queued"}`; saves the Khmer and choices and resumes the job |
+| `PUT /jobs/{id}/segments` (JSON `{"segments": [{"id", "km", "speaker"}]}`, optional `gender`, `original_volume`, `speakers` = `[{"id", "gender"}]`) | `{"status": "queued"}`; saves the Khmer and choices and resumes the job |
 | `GET /jobs/{id}/download/srt` | `khmer.srt` |
 | `GET /jobs/{id}/download/video` | `dubbed.mp4` (only for `dub=true`) |
 | `POST /cleanup` (form `days`, default 7) | `{"deleted": <count>}` |
@@ -325,6 +329,28 @@ after one hour (`$timeout = 3600`) and is not retried (`$tries = 1`).
 `queue:work` keeps the code it started with. After changing PHP code or config, run
 `docker compose restart queue`. The `web` service picks up changes on the next request.
 
+## Glossary and remembered edits
+
+**Glossary** in the top bar opens a list of names and terms, one a line:
+
+```text
+Phnom Penh = ភ្នំពេញ
+Sokha = សុខា
+NASA
+```
+
+`term = Khmer` always puts that Khmer for the term; a term alone is kept as written (a brand
+name, say). Case does not matter, and a term is only found as a whole word. It is used for every
+video uploaded after saving. The worker swaps each term for a marker (`[1]`, `[2]`) before NLLB
+and puts the Khmer back after, so NLLB never sees the name. If NLLB loses a marker, that line is
+translated again without the glossary, and the worker log says so.
+
+When you change a line on the review page, the site remembers your Khmer for that original line.
+A later video with the same line (same spoken language; case, spacing and the final punctuation
+do not count) gets your Khmer without translating it, marked "Your Khmer from an earlier
+video" on its review page. This helps most with a series that repeats its intro and outro. The
+Glossary page shows how many lines are remembered and can forget them all.
+
 ## Editing the Khmer
 
 Machine translation makes mistakes, so a person can correct the Khmer before the voice is made.
@@ -341,12 +367,18 @@ Turn on **Edit the Khmer first** when uploading. Without it, a job runs straight
    end may be cut), so you can shorten it before saving.
    A line with letters but no Khmer ones cannot be saved, because the Khmer voice cannot read it.
    Khmer with a Latin name in it, or a line of only digits, is fine.
-3. **Save and make the voice** (or **Save the subtitles**) resumes the job with your text.
+3. On a dubbed video, **🔊 Listen** on a line makes its Khmer voice from the text in the box,
+   with the voice and speaker chosen on the page, and plays it. The line's hint then gives the
+   voice's real length against its time ("The voice is 3.2 s for 2.5 s, so it will be sped up
+   ×1.28") instead of the guess. Listening saves nothing; it takes 1 to 2 seconds with edge-tts
+   and is limited to 30 lines a minute.
+4. **Save and make the voice** (or **Save the subtitles**) resumes the job with your text.
 
 A finished dubbed video can be corrected later, too. Open it with **Play** and choose **Edit and
 regenerate**. The same page opens, with the voice and **Original sound** to change as well, and
 **Save and regenerate** makes a new voice and video from your text. Speech recognition and
-translation do not run again, so this takes about 2 seconds per line plus the mix. Only the Khmer
+translation do not run again, and only the lines whose Khmer or voice changed are voiced again
+(a line you listened to is not voiced twice), so this takes little more than the mix. Only the Khmer
 can be edited, not the original text. The current video stays until the new one has arrived, and
 if making it fails, the old one stays and the page shows the reason. Editing works until the
 video's files are deleted, 7 days after upload, and regenerating does not extend that.
@@ -356,6 +388,20 @@ Your edits are kept if something goes wrong after saving. If the voice service i
 returns to **Needs review** with the reason, and saving again retries it. If the worker restarts,
 the job goes on by itself; only if it restarts a second time during the same run does the job
 return to **Needs review** with the reason.
+
+## One voice per speaker
+
+Turn on **One voice per speaker** (with **Dub the video**) for a video with more than one person
+talking. After transcription the worker makes a voice print of every line with
+`microsoft/wavlm-base-plus-sv`, groups the lines that sound alike into speakers, and guesses from
+each speaker's pitch whether Sreymom (female) or Piseth (male) fits. Speakers with the same voice
+are pitched apart (0, -2, +2, -3, +3, -1 semitones), so two women still sound different. It takes
+a few seconds; the first time it downloads the model (about 400 MB) into `hf_cache`.
+
+It is a guess, so use it with **Edit the Khmer first**. The review page then lists the speakers,
+each with its voice, and every line has a speaker picker to move it to someone else. Two settings
+in `worker/.env` tune it: `SPEAKER_THRESHOLD` (default 0.85; lower joins more lines into one
+speaker) and `MAX_SPEAKERS` (default 6).
 
 ## Accounts
 
@@ -418,6 +464,7 @@ Keep `post_max_size` a little above `upload_max_filesize`, and change the `max:5
 | `scheduler` | same as `web`              | `php artisan schedule:work` (daily `dub:cleanup`) | none |
 | `mysql`  | `mysql:9.7.4` (LTS)           | database                          | none |
 | `worker` | `python:3.14.10-slim-trixie` + FFmpeg 7.1 | FastAPI on `worker:8001` | none |
+| `reverb` | same as `web` | `php artisan reverb:start`, live progress for the page | 8080 (this computer only) |
 | `mailpit` | `axllent/mailpit:v1.33.1` | catches the site's email; inbox at http://localhost:8025 | 8025 (this computer only) |
 
 On a new database the `queue` service waits, printing "waiting for php artisan migrate",
@@ -428,6 +475,112 @@ The worker port is never published; only the Laravel containers reach it on the 
 Volumes: `mysql_data` (database), `worker_jobs` (`/data/jobs`), `hf_cache` (downloaded models).
 In development `./web` and `./worker` are bind-mounted into their containers, so code changes
 need no rebuild. Rebuild only after changing a Dockerfile or `requirements.txt`.
+
+## Live progress
+
+While a video is processed, the page gets its progress the moment it changes from the `reverb`
+container (Laravel Reverb, self-hosted, MIT) instead of asking every 3 seconds. The browser
+connects to `ws://<the page's host>:8080` with a small script, `web/public/js/live.js`, that
+speaks Reverb's Pusher protocol, so no npm package or CDN is needed. Each user can only join
+their own private channel (`routes/channels.php`).
+
+It is optional. If Reverb is stopped (`docker compose stop reverb`), the page goes back to
+asking every 3 seconds and reconnects by itself when Reverb is back. The site then waits about
+4 s once to give up on Reverb and does not try again for a minute, so a video is never failed or
+held up by it. `BROADCAST_CONNECTION=null` in `web/.env` turns it off. On a fresh install, set
+`REVERB_APP_KEY` and `REVERB_APP_SECRET` in `web/.env` to random values (for example
+`openssl rand -hex 20`). Port 8080 is published to this computer only, so a page opened from
+another device (or through the tunnel below) polls instead.
+
+## Share the site from this computer (Cloudflare quick tunnel, free)
+
+`compose.tunnel.yaml` adds a `cloudflared` service (`cloudflare/cloudflared`, Apache-2.0) that gives
+the site a public HTTPS address on `trycloudflare.com`. It needs no Cloudflare account, no domain
+and no router change, and works behind CGNAT. Nothing else is published: the tunnel reaches only
+`web`, and port 8000 is then open to this computer only.
+
+```bash
+docker compose -f compose.yaml -f compose.tunnel.yaml up --build -d
+docker compose -f compose.yaml -f compose.tunnel.yaml logs cloudflared | grep trycloudflare.com
+```
+
+Open the `https://<random-words>.trycloudflare.com` address it prints, and share it. Naming the
+files with `-f` skips `compose.override.yaml`; if you have one, add `-f compose.override.yaml`
+before the tunnel file. To stop sharing and open port 8000 to the local network again:
+
+```bash
+docker compose up -d --remove-orphans
+```
+
+Limits:
+
+- The address is random and changes every time `cloudflared` restarts (or the computer does).
+  A fixed address needs a free Cloudflare account and your own domain (a "named tunnel").
+- Cloudflare's free proxy refuses uploads over **100 MB**; the page then says the video is too
+  large. Use shorter or smaller videos, or the site directly on http://localhost:8000.
+- Quick tunnels are meant for testing, have no uptime promise, and Cloudflare may limit them.
+- The site is online only while this computer is on, awake and running Docker (on Windows,
+  turn off sleep while sharing).
+- Anyone with the address reaches the login page, and anyone can register an account.
+
+## Online demo on Hugging Face Spaces (free)
+
+To keep the site online while your computer is off, you can run it on a free Hugging Face Space
+(Docker, "CPU basic": 2 CPUs, 16 GB RAM). This needs a free Hugging Face account, with no payment
+card. Everything runs in **one container** made from `deploy/hf-space/`:
+
+| Inside the container | Role |
+| -------------------- | ---- |
+| `php artisan serve` on port 7860 | the site, the only public port |
+| `php artisan queue:work`, `php artisan schedule:work` | queue and daily cleanup |
+| `uvicorn` on `127.0.0.1:8001` | the worker, reachable only inside the container, token checked |
+| SQLite at `/data/db/database.sqlite` | database instead of MySQL |
+| `/opt/models` | Whisper, NLLB, Demucs and MMS, downloaded while the image builds |
+
+`start.sh` makes a random worker token and `APP_KEY` at every start, so the Space needs no secrets.
+Your local `compose.yaml` setup is not changed by any of this.
+
+**Steps (in the WSL terminal, from the repository root):**
+
+1. On https://huggingface.co sign up (free), then **New Space**: choose **Docker**, the **Blank**
+   template and the free **CPU basic** hardware. Public means anyone can see the code and use the site;
+   private means only you, while logged in to Hugging Face.
+2. Make a token with **write** access at https://huggingface.co/settings/tokens.
+3. Assemble the Space folder (`build/hf-space`, ignored by Git) and upload it. The upload script
+   asks for the token without showing or saving it, and runs `hf` inside the worker container:
+
+   ```bash
+   bash deploy/hf-space/build.sh
+   bash deploy/hf-space/upload.sh <your-hf-name>/<space-name>
+   ```
+
+4. The Space builds the image (about 15 to 25 minutes the first time) and starts. Open it at its own
+   address, `https://<your-hf-name>-<space-name>.hf.space`. Logins may fail inside the frame on the
+   huggingface.co page.
+
+Run steps 3 again after every change. To test the same image on your computer first:
+
+```bash
+bash deploy/hf-space/build.sh
+docker build -t khmer-dub-space build/hf-space
+docker run --rm -p 7860:7860 -e SESSION_SECURE_COOKIE=false -e SESSION_SAME_SITE=lax khmer-dub-space
+```
+
+then open http://localhost:7860.
+
+**Limits of the free Space:**
+
+- **Nothing is kept.** Each restart wipes accounts, uploads, results and job history. A restart comes
+  with every upload of new code, after about 48 hours without visitors (the Space sleeps; the next
+  visit wakes it in a few minutes), and whenever Hugging Face moves it. Persistent storage is a paid
+  add-on, so it is not used. Download results right away.
+- Password reset emails are not sent (`MAIL_MAILER=log`).
+- The image is about 14 GB (PyTorch and the models), so each build on the Space takes a while.
+- Two CPUs: transcription and the voice are about as slow as on a laptop, or slower.
+- Large uploads have not been tested against Hugging Face's proxy; if 500 MB uploads fail, use smaller videos.
+- `edge-tts` needs internet, which the Space has. Set the Space variable `TTS_ENGINE=mms` for the offline voice.
+- Keep the image tags and `TORCH_VERSION` in `deploy/hf-space/Dockerfile` the same as in
+  `web/Dockerfile` and `worker/Dockerfile`.
 
 ## Versions
 
@@ -443,6 +596,7 @@ the 16 kHz WAV itself and passes Whisper the samples.
 
 | Component | License |
 | --- | --- |
+| Laravel Reverb, pusher-php-server, ratchet/rfc6455, ReactPHP, clue/redis-react (used by Reverb) | MIT |
 | Laravel, FastAPI, faster-whisper, CTranslate2, pydub, pytest, Demucs, einops, julius, Mailpit | MIT |
 | sphn (used by Demucs) | Apache-2.0 |
 | lameenc (used by Demucs) | LGPL-3.0 |
@@ -457,11 +611,19 @@ the 16 kHz WAV itself and passes Whisper the samples.
 | MySQL Community Server | GPL-2.0 |
 | Whisper model weights | MIT |
 | NLLB-200 and MMS-TTS model weights | CC-BY-NC-4.0 (non-commercial use only) |
+| WavLM-Base-Plus-SV speaker model weights (Microsoft UniSpeech) | CC BY-SA 3.0 |
 
 ## Known limits
 
 - Free translation (NLLB) is less natural than a paid LLM and can mistranslate names and numbers.
   Khmer output needs review by a Khmer speaker.
+- The glossary puts a term where NLLB put its marker, which follows the original word order. That
+  is right for names and nouns, but an adjective can land in English order ("American space
+  exploration" came out as អាមេរិកាំង ការស្រាវជ្រាវអវកាស). Use it for names and terms,
+  not for describing words. Remembered edits only match a whole line, not part of one.
+- Translating each line together with the lines around it was tried and dropped: NLLB 600M then
+  wrote Sinhala letters into Khmer words, cut words short, and gave one line the next line's
+  translation.
 - NLLB puts a space between every Khmer word, which normal Khmer writing does not do.
   `KHMER_SPACES=remove` in `worker/.env` joins the Khmer words (spaces next to punctuation, digits
   and Latin words stay). It is off until a Khmer speaker has compared both. Without spaces, a
@@ -474,8 +636,11 @@ the 16 kHz WAV itself and passes Whisper the samples.
   came out word for word the same and the rest differed by a word or two. The first job converts
   the model once (about 30 s, 630 MB more in `hf_cache`).
 - `edge-tts` is unofficial and needs internet. It may change or stop working. Set `TTS_ENGINE=mms`
-  for the fully offline (more robotic) voice. It sometimes sends no audio for an ordinary
-  sentence. The worker retries, and the job fails with a message after three tries.
+  for the fully offline (more robotic) voice. At busy times it sends no audio for 7 to 37% of
+  ordinary lines at random, and the same line works a second later. The worker tries such a line up
+  to 10 times, so a long video still gets through; if one line fails all 10, the job goes back to
+  review with "The Khmer voice could not read this line", and saving again goes on from that line
+  (the lines already voiced are kept).
 - MMS-TTS cannot read digits or Latin letters, and NLLB writes numbers as Khmer digits
   (`៥, ៤, ៣`), so with `mms` the numbers are silent.
 - The original music and sound effects stay in the dubbed video, but so does the original speech,
@@ -486,7 +651,14 @@ the 16 kHz WAV itself and passes Whisper the samples.
 - Khmer is often longer than the original, so the voice can keep talking after the speaker has
   stopped (up to 0.8 s on the test clip). Lines with no silence after them are sped up instead,
   and can still lose the end of their speech even at x1.6.
-- Making the voice takes about 2 seconds per line with edge-tts.
+- Making the voice takes about 2 seconds per line with edge-tts. Each job keeps its voice clips
+  until cleanup, so editing it later is quick; that is about 3 MB per minute of speech in the
+  `worker_jobs` volume.
+- **One voice per speaker** is a guess from voice prints. People who sound alike can be merged,
+  one person recorded in two places can be split, lines under 1 s take the speaker next to them,
+  and people talking over each other are not separated. The male or female guess comes from pitch
+  only. There are just two Khmer voices, so a third speaker differs from the first by pitch only,
+  and a voice moved in pitch sounds slightly less natural.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
 - The worker runs one job at a time, so an upload can wait in the queue behind a long video; the
   page says how many videos are ahead. A worker restart puts the jobs it was working on back in

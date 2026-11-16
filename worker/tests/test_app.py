@@ -42,9 +42,10 @@ def runs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 
     def run(job_dir: Path, video_path: Path, gender: str, dub: bool, progress: Progress, original_volume: float | None = None,
             prepared: dict | None = None, on_prepared: Callable[[dict], None] | None = None,
-            language: str | None = None, separate: bool = False) -> dict:
+            language: str | None = None, separate: bool = False, speakers: bool = False, **terms: object) -> dict:
         calls.append({"video": Path(video_path), "exists": Path(video_path).is_file(), "gender": gender, "dub": dub,
-                      "original_volume": original_volume, "prepared": prepared, "language": language, "separate": separate})
+                      "original_volume": original_volume, "prepared": prepared, "language": language, "separate": separate,
+                      "speakers": speakers, **terms})
         if prepared is None:
             for percent, message in [(5, "Extracting audio"), (15, "Transcribing speech"), (45, "Translating to Khmer")]:
                 progress(percent, message)
@@ -56,7 +57,7 @@ def runs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         if dub:
             progress(60, "Making the Khmer voice")
             progress(85, "Mixing and merging")
-            (Path(job_dir) / "clips").mkdir()
+            (Path(job_dir) / "clips").mkdir(exist_ok=True)
             video = Path(job_dir) / "dubbed.mp4"
             video.write_bytes(b"fake mp4")
         progress(100, "Done")
@@ -132,7 +133,7 @@ def test_dub_job_end_to_end(client: TestClient, runs: list[dict], work_dir: Path
 
     assert wait(client, job_id) == {"status": "done", "progress": 100, "message": "Done", "error": None, "language": "en", "done": None, "total": None}
     assert runs == [{"video": work_dir / job_id / "input.mp4", "exists": True, "gender": "male", "dub": True,
-                     "original_volume": None, "prepared": None, "language": None, "separate": False}]
+                     "original_volume": None, "prepared": None, "language": None, "separate": False, "speakers": False, "glossary": [], "memory": []}]
 
     srt = client.get(f"/jobs/{job_id}/download/srt", headers=AUTH)
     assert srt.status_code == 200
@@ -146,7 +147,7 @@ def test_dub_job_end_to_end(client: TestClient, runs: list[dict], work_dir: Path
     folder = work_dir / job_id
     saved = json.loads((folder / "status.json").read_text(encoding="utf-8"))
     assert saved["status"] == "done" and saved["language"] == "en"
-    assert sorted(p.name for p in folder.iterdir()) == ["dubbed.mp4", "khmer.srt", "status.json"]
+    assert sorted(p.name for p in folder.iterdir()) == ["clips", "dubbed.mp4", "khmer.srt", "status.json"], "the clips stay for editing"
 
 
 def test_subtitles_only_job(client: TestClient, runs: list[dict], tone_video: Path) -> None:
@@ -198,7 +199,7 @@ def test_a_review_job_uses_its_language_and_keeps_the_speech_removal(
     seen: dict = {}
     prepare, finish = pipeline.prepare, pipeline.finish
 
-    def spy_prepare(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None) -> dict:
+    def spy_prepare(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None, speakers: bool = False, **_: object) -> dict:
         seen["language"] = language
         return prepare(job_dir, video_path, progress, language)
 
@@ -447,7 +448,7 @@ def finished(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     """Replace pipeline.prepare and finish with fakes; return what each finish call saw."""
     calls: list[dict] = []
 
-    def prepare(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None) -> dict:
+    def prepare(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None, speakers: bool = False, **_: object) -> dict:
         progress(45, "Translating to Khmer")
         pipeline.save_segments(job_dir, [dict(seg) for seg in LINES])
         return {"language": "en", "duration": 60.0}
@@ -500,7 +501,7 @@ def test_review_job_stops_after_translation_and_shows_its_lines(client: TestClie
     assert finished == [], "the voice must wait for the review"
     response = client.get(f"/jobs/{job_id}/segments", headers=AUTH)
     assert response.status_code == 200
-    assert response.json() == {"segments": LINES}
+    assert response.json() == {"segments": [{**seg, "speaker": None, "reused": False} for seg in LINES], "speakers": []}
     assert client.get(f"/jobs/{job_id}/download/srt", headers=AUTH).status_code == 404
 
 
@@ -556,7 +557,7 @@ def test_bad_edits_change_nothing(client: TestClient, finished: list, tone_video
     assert response.status_code == 422
     assert detail in response.json()["detail"]
     assert client.get(f"/jobs/{job_id}", headers=AUTH).json()["status"] == "review"
-    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).json() == {"segments": LINES}
+    assert client.get(f"/jobs/{job_id}/segments", headers=AUTH).json() == {"segments": [{**seg, "speaker": None, "reused": False} for seg in LINES], "speakers": []}
 
 
 def test_lines_with_no_khmer_cannot_be_saved(client: TestClient, finished: list, tone_video: Path) -> None:
@@ -893,7 +894,7 @@ def test_failed_voice_keeps_the_edits_and_can_be_retried(
 
 
 def test_a_failed_translation_fails_the_job(client: TestClient, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_speech(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None) -> dict:
+    def no_speech(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None, speakers: bool = False, **_: object) -> dict:
         raise StageError("No speech was found in the video.")
 
     monkeypatch.setattr(pipeline, "prepare", no_speech)
@@ -974,3 +975,168 @@ def test_cleanup_deletes_an_abandoned_review(client: TestClient, finished: list,
 
     assert client.post("/cleanup", headers=AUTH, data={"days": "7"}).json() == {"deleted": 1}
     assert list(work_dir.iterdir()) == []
+
+
+def test_speakers_reach_the_pipeline_and_are_checked(client: TestClient, runs: list[dict], work_dir: Path, tone_video: Path) -> None:
+    job_id = upload(client, tone_video, speakers="true").json()["job_id"]
+    wait(client, job_id)
+    assert runs[0]["speakers"] is True
+
+    response = upload(client, tone_video, speakers="perhaps")
+    assert response.status_code == 422
+    assert response.json()["detail"] == "speakers must be true or false."
+
+
+@pytest.fixture
+def two_speakers(monkeypatch: pytest.MonkeyPatch, finished: list[dict]) -> list[dict]:
+    """Like `finished`, but prepare also finds two speakers: a woman says line 0 and a man line 1."""
+    prepare = pipeline.prepare
+
+    def prepare_with_speakers(job_dir: Path, video_path: Path, progress: Progress, language: str | None = None,
+                              speakers: bool = False, **_: object) -> dict:
+        prepared = prepare(job_dir, video_path, progress, language)
+        segments = pipeline.load_segments(job_dir)
+        for seg in segments:
+            seg["speaker"] = seg["id"]
+        pipeline.save_segments(job_dir, segments)
+        pipeline.save_speakers(job_dir, [{"id": 0, "gender": "female", "lines": 1}, {"id": 1, "gender": "male", "lines": 1}])
+        return prepared
+
+    monkeypatch.setattr(pipeline, "prepare", prepare_with_speakers)
+    return finished
+
+
+def test_review_shows_the_speakers_and_saves_their_voices(
+        client: TestClient, two_speakers: list, work_dir: Path, tone_video: Path) -> None:
+    job_id = in_review(client, tone_video, speakers="true")
+
+    shown = client.get(f"/jobs/{job_id}/segments", headers=AUTH).json()
+    assert [seg["speaker"] for seg in shown["segments"]] == [0, 1]
+    assert shown["speakers"] == [{"id": 0, "gender": "female", "lines": 1}, {"id": 1, "gender": "male", "lines": 1}]
+
+    body = {"segments": [{"id": 0, "km": "សួស្តី", "speaker": 1}], "speakers": [{"id": 0, "gender": "male"}]}
+    assert client.put(f"/jobs/{job_id}/segments", headers=AUTH, json=body).status_code == 200
+    wait(client, job_id)
+
+    assert [seg["speaker"] for seg in pipeline.load_segments(work_dir / job_id)] == [1, 1]
+    assert pipeline.load_speakers(work_dir / job_id) == [{"id": 0, "gender": "male", "lines": 0}, {"id": 1, "gender": "male", "lines": 2}]
+
+
+@pytest.mark.parametrize(("body", "detail"), [
+    ({"segments": [{"id": 0, "km": "ក", "speaker": 5}]}, "These speakers are not part of this job: [5]."),
+    ({"segments": [], "speakers": [{"id": 9, "gender": "male"}]}, "These speakers are not part of this job: [9]."),
+    ({"segments": [], "speakers": [{"id": 0, "gender": "robot"}]}, "A speaker's gender must be female or male."),
+])
+def test_bad_speaker_edits_change_nothing(client: TestClient, two_speakers: list, work_dir: Path, tone_video: Path,
+                                          body: dict, detail: str) -> None:
+    job_id = in_review(client, tone_video, speakers="true")
+    response = client.put(f"/jobs/{job_id}/segments", headers=AUTH, json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"] == detail
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).json()["status"] == "review"
+    assert pipeline.load_speakers(work_dir / job_id)[0]["gender"] == "female"
+
+
+def test_the_glossary_and_memory_reach_the_pipeline_and_are_tidied_away(
+        client: TestClient, runs: list[dict], work_dir: Path, tone_video: Path) -> None:
+    glossary = [{"term": "Sokha", "km": "សុខា"}, {"term": "NASA"}]
+    memory = [{"language": "en", "text": "Welcome back", "km": "សូមស្វាគមន៍"}]
+
+    job_id = upload(client, tone_video, glossary=json.dumps(glossary), memory=json.dumps(memory)).json()["job_id"]
+    wait(client, job_id)
+
+    assert runs[0]["glossary"] == [{"term": "Sokha", "km": "សុខា"}, {"term": "NASA", "km": ""}]
+    assert runs[0]["memory"] == memory
+    assert not (work_dir / job_id / "terms.json").exists(), "the user's terms do not stay on the worker"
+
+
+@pytest.mark.parametrize(("field", "value", "detail"), [
+    ("glossary", "not json", "glossary must be a JSON list"),
+    ("glossary", json.dumps([{"km": "ក"}]), "glossary must be a JSON list"),  # no term
+    ("glossary", json.dumps([{"term": "x" * 101}]), "glossary must be a JSON list"),
+    ("glossary", json.dumps([{"term": f"t{n}"} for n in range(501)]), "glossary can have at most 500 entries."),
+    ("memory", json.dumps([{"text": "Hi", "km": "ជំរាបសួរ"}]), "memory must be a JSON list"),  # no language
+])
+def test_a_bad_glossary_or_memory_is_refused(client: TestClient, work_dir: Path, tone_video: Path,
+                                            field: str, value: str, detail: str) -> None:
+    response = upload(client, tone_video, **{field: value})
+    assert response.status_code == 422
+    assert detail in response.json()["detail"]
+    assert list(work_dir.iterdir()) == []
+
+
+def test_the_review_shows_which_lines_came_from_the_memory(client: TestClient, finished: list, work_dir: Path,
+                                                           tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prepare = pipeline.prepare
+
+    def prepare_with_memory(job_dir: Path, *args: object, **kwargs: object) -> dict:
+        prepared = prepare(job_dir, *args, **kwargs)
+        segments = pipeline.load_segments(job_dir)
+        segments[1]["reused"] = True
+        pipeline.save_segments(job_dir, segments)
+        return prepared
+
+    monkeypatch.setattr(pipeline, "prepare", prepare_with_memory)
+    job_id = in_review(client, tone_video)
+
+    shown = client.get(f"/jobs/{job_id}/segments", headers=AUTH).json()["segments"]
+    assert [seg["reused"] for seg in shown] == [False, True]
+
+
+@pytest.fixture
+def voiced(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    """Replace pipeline.line_voice with one that writes a 1.5 s tone; return what each call asked for."""
+    from tests.conftest import tone
+    asked: list[tuple] = []
+
+    def line_voice(job_dir: Path, text: str, gender: str, speaker: int | None = None, voices: dict | None = None) -> Path:
+        asked.append((text, gender, speaker, voices))
+        (Path(job_dir) / "clips").mkdir(exist_ok=True)
+        return Path(tone(Path(job_dir) / "clips" / "line.wav", 1.5))
+
+    monkeypatch.setattr(pipeline, "line_voice", line_voice)
+    return asked
+
+
+def test_one_line_can_be_heard_before_saving(client: TestClient, finished: list, voiced: list, tone_video: Path) -> None:
+    job_id = in_review(client, tone_video, gender="male")
+
+    response = client.post(f"/jobs/{job_id}/voice", headers=AUTH,
+                           json={"text": " សួស្តី ", "speaker": 1, "speakers": [{"id": 1, "gender": "female"}]})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.headers["x-clip-seconds"] == "1.50"
+    assert voiced == [("សួស្តី", "male", 1, {1: "female"})]
+    assert client.get(f"/jobs/{job_id}", headers=AUTH).json()["status"] == "review", "hearing a line changes nothing"
+
+
+@pytest.mark.parametrize(("body", "status", "detail"), [
+    ({"text": "Hello"}, 422, "This line has no Khmer text to say."),
+    ({"text": "..."}, 422, "This line has no Khmer text to say."),
+    ({"text": "ក", "gender": "robot"}, 422, "gender must be female or male."),
+    ({"text": ""}, 422, "Bad input."),
+])
+def test_a_line_that_cannot_be_voiced_is_refused(client: TestClient, finished: list, voiced: list, tone_video: Path,
+                                                 body: dict, status: int, detail: str) -> None:
+    job_id = in_review(client, tone_video)
+    response = client.post(f"/jobs/{job_id}/voice", headers=AUTH, json=body)
+    assert response.status_code == status
+    assert response.json()["detail"].startswith(detail)
+    assert voiced == []
+
+
+def test_only_a_dubbed_job_in_review_or_done_has_a_voice(client: TestClient, finished: list, voiced: list, tone_video: Path) -> None:
+    job_id = in_review(client, tone_video, dub="false")
+    assert client.post(f"/jobs/{job_id}/voice", headers=AUTH, json={"text": "ក"}).status_code == 409
+    assert client.post("/jobs/" + "0" * 32 + "/voice", headers=AUTH, json={"text": "ក"}).status_code == 404
+
+
+def test_a_voice_service_failure_is_503(client: TestClient, finished: list, tone_video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def down(*args: object, **kwargs: object) -> Path:
+        raise StageError("The Khmer voice service (edge-tts) could not be reached.")
+
+    monkeypatch.setattr(pipeline, "line_voice", down)
+    job_id = in_review(client, tone_video)
+    response = client.post(f"/jobs/{job_id}/voice", headers=AUTH, json={"text": "ក"})
+    assert (response.status_code, response.json()["detail"]) == (503, "The Khmer voice service (edge-tts) could not be reached.")

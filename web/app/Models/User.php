@@ -19,7 +19,7 @@ class User extends Authenticatable
     use HasFactory, Notifiable;
 
     /** The upload form's choices until a user has made their own. */
-    public const DUB_DEFAULTS = ['gender' => 'female', 'dub' => true, 'review' => false, 'original_volume' => 0.0, 'separate' => false];
+    public const DUB_DEFAULTS = ['gender' => 'female', 'dub' => true, 'review' => false, 'original_volume' => 0.0, 'separate' => false, 'speakers' => false];
 
     /**
      * Get the attributes that should be cast.
@@ -32,6 +32,7 @@ class User extends Authenticatable
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
             'dub_options' => 'array',
+            'glossary' => 'array',
         ];
     }
 
@@ -53,5 +54,25 @@ class User extends Authenticatable
     public function videoJobs(): HasMany
     {
         return $this->hasMany(VideoJob::class);
+    }
+
+    /**
+     * The Khmer this user wrote for lines when reviewing, to reuse in later videos.
+     *
+     * @return HasMany<TranslationMemory, $this>
+     */
+    public function translationMemories(): HasMany
+    {
+        return $this->hasMany(TranslationMemory::class);
+    }
+
+    /**
+     * The glossary: terms to keep as written (empty km) or to put in the given Khmer.
+     *
+     * @return list<array{term: string, km: string}>
+     */
+    public function glossaryEntries(): array
+    {
+        return array_values($this->glossary ?? []);
     }
 }

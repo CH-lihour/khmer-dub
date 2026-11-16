@@ -36,6 +36,8 @@ class Worker
             => "Unsupported file type ':type'. Upload an MP4, MOV, MKV or WebM video.",
         '/^These lines have no Khmer text: (?<lines>.*)\. Write them in Khmer, or empty them\.$/'
             => 'These lines have no Khmer text: :lines. Write them in Khmer, or empty them.',
+        '/^These speakers are not part of this job: (?<speakers>.*)\.$/'
+            => 'These speakers are not part of this job: :speakers.',
         '/^The worker answered HTTP (?<status>\d+)\. Check the worker log: docker compose logs worker$/'
             => 'The worker answered HTTP :status. Check the worker log: docker compose logs worker',
         '/^The worker could not .+ \(HTTP (?<status>\d+)\)\. Check the worker log: docker compose logs worker$/'

@@ -3,6 +3,7 @@
 import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import config
@@ -92,12 +93,32 @@ def test_edge_is_retried_twice(no_sleep: None, tmp_path: Path, monkeypatch: pyte
     assert len(attempts) == 3
 
 
-def test_edge_no_audio_is_retried(no_sleep: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The service sometimes sends no audio for an ordinary sentence that works on the next try.
-    attempts = failing_edge(monkeypatch, failures=1, error=tts.edge_tts.exceptions.NoAudioReceived("No audio"))
+def test_edge_no_audio_is_retried_many_times(no_sleep: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # At busy times the service sends no audio for a third of ordinary lines, which work on the next try.
+    attempts = failing_edge(monkeypatch, failures=tts.EDGE_NO_AUDIO_TRIES - 1,
+                            error=tts.edge_tts.exceptions.NoAudioReceived("No audio"))
     out = synth("ការ ពង្រីក ចំណេះ ដឹង", tmp_path / "0.wav", "female")
-    assert len(attempts) == 2
+    assert len(attempts) == tts.EDGE_NO_AUDIO_TRIES
     assert wav_info(out)[2] > 0.3
+
+
+def test_no_audio_tries_do_not_use_up_the_network_retries(no_sleep: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    errors = iter([tts.edge_tts.exceptions.NoAudioReceived("No audio")] * 5 + [ConnectionError("reset")] * 2)
+    attempts = failing_edge(monkeypatch, failures=7)
+    monkeypatch.setattr(tts.edge_tts, "Communicate", _raising(tts.edge_tts.Communicate, errors))
+    assert synth("សួស្តី", tmp_path / "0.wav", "female").exists()
+    assert len(attempts) == 8
+
+
+def _raising(flaky: type, errors: object) -> type:
+    """Wrap failing_edge's class so each failure raises the next error from `errors`."""
+    class Mixed(flaky):
+        def save_sync(self, path: str) -> None:
+            try:
+                super().save_sync(path)
+            except Exception:
+                raise next(errors) from None
+    return Mixed
 
 
 def test_a_line_the_voice_cannot_read_is_not_called_a_network_problem(no_sleep: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -105,7 +126,7 @@ def test_a_line_the_voice_cannot_read_is_not_called_a_network_problem(no_sleep: 
     with pytest.raises(StageError, match="could not read this line: සිංහල") as caught:
         synth("සිංහල", tmp_path / "0.wav", "female")
     assert "internet" not in str(caught.value)
-    assert len(attempts) == 3
+    assert len(attempts) == tts.EDGE_NO_AUDIO_TRIES
 
 
 def test_text_with_nothing_to_say_is_silent_without_the_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,7 +150,7 @@ def test_synth_all_skips_segments_without_khmer(fake_edge: list, tmp_path: Path)
     synth_all(segments, tmp_path / "clips", "female", lambda done, total: steps.append((done, total)))
 
     assert steps == [(1, 1)], "only lines with Khmer are counted"
-    assert segments[0]["clip"] == str(tmp_path / "clips" / "0.wav")
+    assert segments[0]["clip"] == str(tts.clip_path("សួស្តី", tmp_path / "clips", "female"))
     assert Path(segments[0]["clip"]).exists()
     assert "clip" not in segments[1] and "clip" not in segments[2]
     assert len(fake_edge) == 1
@@ -160,3 +181,60 @@ def test_real_edge_khmer_voice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     channels, rate, seconds = wav_info(out)
     assert (channels, rate) == (1, 24000)
     assert 1.5 < seconds < 3.2, "about 3.2 s with edge-tts' own silence, less once it is trimmed"
+
+
+def loudest_frequency(path: Path) -> float:
+    """The strongest frequency in Hz of a WAV clip."""
+    with wave.open(str(path), "rb") as wav:
+        rate = wav.getframerate()
+        samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(float)
+    spectrum = np.abs(np.fft.rfft(samples))
+    return float(np.fft.rfftfreq(len(samples), 1 / rate)[np.argmax(spectrum)])
+
+
+def test_pitch_moves_the_voice_and_keeps_its_length(fake_edge: list, tmp_path: Path) -> None:
+    normal = synth("សួស្តី", tmp_path / "normal.wav", "female")
+    higher = synth("សួស្តី", tmp_path / "higher.wav", "female", pitch=12)  # one octave
+
+    assert loudest_frequency(normal) == pytest.approx(300, rel=0.03)
+    assert loudest_frequency(higher) == pytest.approx(600, rel=0.03)
+    assert wav_info(higher)[:2] == (1, 24000)
+    assert wav_info(higher)[2] == pytest.approx(wav_info(normal)[2], abs=0.05)
+
+
+def test_synth_all_gives_each_speaker_their_voice(fake_edge: list, tmp_path: Path) -> None:
+    segments = [{"id": 0, "km": "ក", "speaker": 0}, {"id": 1, "km": "ខ", "speaker": 1}, {"id": 2, "km": "គ"}]
+
+    synth_all(segments, tmp_path / "clips", "female", voices={0: ("male", 0), 1: ("female", -2)})
+
+    assert [voice for _, voice in fake_edge] == ["km-KH-PisethNeural", "km-KH-SreymomNeural", "km-KH-SreymomNeural"]
+    assert loudest_frequency(Path(segments[1]["clip"])) < loudest_frequency(Path(segments[2]["clip"])), "speaker 1 is lower"
+
+
+def test_making_the_voice_again_only_voices_the_lines_that_changed(fake_edge: list, tmp_path: Path) -> None:
+    segments = [{"id": 0, "km": "ក"}, {"id": 1, "km": "ខ"}, {"id": 2, "km": "គ"}]
+    synth_all(segments, tmp_path / "clips", "female")
+    first = [seg["clip"] for seg in segments]
+
+    segments[1]["km"] = "ខ្មែរ"
+    synth_all(segments, tmp_path / "clips", "female")
+
+    assert [text for text, _ in fake_edge] == ["ក", "ខ", "គ", "ខ្មែរ"]
+    assert [seg["clip"] for seg in segments][::2] == first[::2]
+
+
+def test_a_clip_is_named_by_its_text_and_voice(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(config, "TTS_ENGINE", "edge")
+    names = {tts.clip_path("ក", tmp_path, "female"), tts.clip_path(" ក ", tmp_path, "female"),
+             tts.clip_path("ក", tmp_path, "male"), tts.clip_path("ក", tmp_path, "female", -2)}
+    assert len(names) == 3, "spaces around the text do not count; the voice and the pitch do"
+
+    monkeypatch.setattr(config, "TTS_ENGINE", "mms")
+    assert tts.clip_path("ក", tmp_path, "female") == tts.clip_path("ក", tmp_path, "male"), "MMS has one voice"
+
+
+def test_a_failed_clip_is_not_kept(no_sleep: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    failing_edge(monkeypatch, failures=3)
+    with pytest.raises(StageError):
+        tts.cached_clip("ក", tmp_path, "female")
+    assert list(tmp_path.iterdir()) == []

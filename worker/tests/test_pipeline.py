@@ -25,7 +25,7 @@ def fake_stages(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("transcribe")
         return [{"id": 0, "start": 1.0, "end": 2.5, "text": "Hello"}], "en"
 
-    def translate(segments: list[dict], src_lang: str, on_step: Callable | None = None) -> list[dict]:
+    def translate(segments: list[dict], src_lang: str, on_step: Callable | None = None, **terms: object) -> list[dict]:
         calls.append(f"translate:{src_lang}")
         segments[0]["km"] = "សួស្តី"
         return segments
@@ -61,7 +61,7 @@ def test_stage_error_stops_the_run(fake_stages: list[str], tmp_path: Path, monke
 
 
 def test_dubbing(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None) -> list[dict]:
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None, voices: dict | None = None) -> list[dict]:
         fake_stages.append(f"voice:{gender}")
         return segments
 
@@ -110,7 +110,7 @@ def test_removing_the_speech_comes_before_the_mix_and_is_kept(
         Path(out).write_bytes(b"wav")
         return Path(out)
 
-    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step=None: segments)
+    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step=None, voices=None: segments)
     monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
     monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, volume, srt=None, background=None: mixed.append(background) or out)
     monkeypatch.setattr(pipeline, "separate_speech", separate)
@@ -131,7 +131,7 @@ def test_removing_the_speech_comes_before_the_mix_and_is_kept(
 
 
 def test_long_stages_report_how_far_they_are(fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable) -> list[dict]:
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable, voices: dict | None = None) -> list[dict]:
         on_step(1, 4)
         on_step(4, 4)
         return segments
@@ -170,7 +170,7 @@ def test_making_a_job_again_forgets_the_voice_of_an_emptied_line(
         placed.extend(seg.get("clip") for seg in segments)
         return folder / "dub.wav"
 
-    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step: segments)
+    monkeypatch.setattr(pipeline, "synth_all", lambda segments, folder, gender, on_step, voices=None: segments)
     monkeypatch.setattr(pipeline, "build_track", build_track)
     monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume, srt=None, background=None: out)
 
@@ -185,7 +185,7 @@ def test_edits_saved_between_prepare_and_finish_reach_the_subtitles_and_the_voic
 ) -> None:
     voiced: list[str] = []
 
-    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None) -> list[dict]:
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None, voices: dict | None = None) -> list[dict]:
         voiced.extend(seg["km"] for seg in segments)
         return segments
 
@@ -237,3 +237,80 @@ def test_real_video_dubbed(speech_video: Path, tmp_path: Path) -> None:
     assert all(1.0 <= seg["speed"] <= 1.6 for seg in segments if "speed" in seg)
     for seg, after in zip(segments, segments[1:]):
         assert seg.get("dub_end", 0) <= after["start"]
+
+
+def test_speakers_are_found_before_the_translation_and_get_their_voices(
+    fake_stages: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    given: dict = {}
+
+    def find_speakers(wav_path: Path, segments: list[dict], on_step: Callable | None = None) -> list[dict]:
+        fake_stages.append("speakers")
+        segments[0]["speaker"] = 0
+        return [{"id": 0, "gender": "male", "lines": 1}, {"id": 1, "gender": "male", "lines": 0}]
+
+    def synth_all(segments: list[dict], folder: Path, gender: str, on_step: Callable | None = None, voices: dict | None = None) -> list[dict]:
+        given.update(voices=voices, speaker=segments[0]["speaker"])
+        return segments
+
+    monkeypatch.setattr(pipeline, "find_speakers", find_speakers)
+    monkeypatch.setattr(pipeline, "synth_all", synth_all)
+    monkeypatch.setattr(pipeline, "build_track", lambda segments, total_ms, folder: folder / "dub.wav")
+    monkeypatch.setattr(pipeline, "merge", lambda video, dub_wav, out, original_volume, srt=None, background=None: out)
+    milestones: list[int] = []
+
+    pipeline.run(tmp_path / "job", "in.mp4", "female", True, lambda p, m, *how_far: milestones.append(p), speakers=True)
+
+    assert fake_stages == ["audio", "transcribe", "speakers", "translate:en"]
+    assert milestones == [5, 15, 38, 45, 60, 85, 100]
+    assert pipeline.load_speakers(tmp_path / "job")[0]["gender"] == "male"
+    assert given == {"voices": {0: ("male", 0), 1: ("male", -2)}, "speaker": 0}, "the second man sounds lower"
+
+
+def test_a_job_without_speakers_has_none(fake_stages: list[str], tmp_path: Path) -> None:
+    pipeline.prepare(tmp_path / "job", "in.mp4", lambda p, m, *how_far: None)
+    assert "speakers" not in fake_stages
+    assert pipeline.load_speakers(tmp_path / "job") == []
+
+
+def test_voice_map_spreads_the_pitch_of_speakers_with_the_same_voice() -> None:
+    speakers = [{"id": n, "gender": gender} for n, gender in enumerate(["female", "male", "female", "female", "male"])]
+    assert pipeline.voice_map(speakers) == {0: ("female", 0), 1: ("male", 0), 2: ("female", -2), 3: ("female", 2), 4: ("male", -2)}
+
+
+def test_the_glossary_and_memory_go_to_the_translation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_stages: list[str]) -> None:
+    seen: dict = {}
+
+    def translate(segments: list[dict], src_lang: str, on_step: Callable | None = None, **terms: object) -> list[dict]:
+        seen.update(terms)
+        segments[0]["km"] = "សួស្តី"
+        return segments
+
+    monkeypatch.setattr(pipeline, "translate", translate)
+    pipeline.prepare(tmp_path / "job", "in.mp4", lambda p, m, *how_far: None,
+                     glossary=[{"term": "Sokha", "km": "សុខា"}], memory=[{"language": "en", "text": "Hi", "km": "ជំរាបសួរ"}])
+    assert seen == {"glossary": [{"term": "Sokha", "km": "សុខា"}], "memory": [{"language": "en", "text": "Hi", "km": "ជំរាបសួរ"}]}
+
+
+def test_clips_no_line_uses_are_pruned(tmp_path: Path) -> None:
+    for name in ("used.wav", "used.x1.20.wav", "old.wav"):
+        (tmp_path / name).write_bytes(b"")
+    pipeline.prune_clips(tmp_path, [{"clip": str(tmp_path / "used.wav")}, {"km": ""}])
+    assert [p.name for p in tmp_path.iterdir()] == ["used.wav"]
+
+
+def test_a_line_is_voiced_like_its_speaker_with_the_unsaved_choices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    made: list[tuple] = []
+
+    def cached_clip(text: str, folder: Path, gender: str, pitch: int = 0) -> tuple[Path, bool]:
+        made.append((text, gender, pitch))
+        return folder / "x.wav", True
+
+    monkeypatch.setattr(pipeline, "cached_clip", cached_clip)
+    pipeline.save_speakers(tmp_path, [{"id": 0, "gender": "female", "lines": 1}, {"id": 1, "gender": "male", "lines": 1}])
+
+    pipeline.line_voice(tmp_path, "ក", "male")
+    pipeline.line_voice(tmp_path, "ក", "male", speaker=1)
+    pipeline.line_voice(tmp_path, "ក", "male", speaker=1, voices={0: "male"})  # now two men: the second is lower
+
+    assert made == [("ក", "male", 0), ("ក", "male", 0), ("ក", "male", -2)]

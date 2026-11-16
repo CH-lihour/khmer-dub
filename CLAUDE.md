@@ -30,7 +30,8 @@ Use exactly these tools. Do not substitute without asking the developer.
 | Web backend | Latest Laravel (13.x) on PHP 8.5, in Docker | Auth, uploads, queue, status, downloads |
 | Database | MySQL | Table `video_jobs` |
 | Queue | Laravel database queue | No Redis needed |
-| Frontend | Blade + plain JavaScript (fetch polling) | No React for now |
+| Frontend | Blade + plain JavaScript (live progress from Reverb, fetch polling as the fallback) | No React for now |
+| Live progress | Laravel Reverb (MIT), self-hosted in the `reverb` container; the page speaks its Pusher protocol in `web/public/js/live.js` (no npm) | Optional: with it stopped or `BROADCAST_CONNECTION=null`, the page polls |
 | AI worker | Latest stable Python (3.14, or 3.13 if a package has no 3.14 build), latest FastAPI, Uvicorn, in Docker | One worker thread, jobs run one at a time |
 | Audio and video | FFmpeg, pydub | Installed in the worker image with apt |
 | Speech-to-text | faster-whisper | Model `small` by default, `medium` if the machine allows |
@@ -38,6 +39,7 @@ Use exactly these tools. Do not substitute without asking the developer.
 | Khmer voice (main) | `edge-tts`, voices `km-KH-SreymomNeural` and `km-KH-PisethNeural` | Free but needs internet and is unofficial; isolate it behind one function |
 | Khmer voice (offline fallback) | `facebook/mms-tts-khm` via `transformers` | Robotic but fully local; switch with an env flag |
 | Remove the original speech (optional) | Demucs `htdemucs` (MIT) | Local; only with `separate=true`; about half the video length on CPU |
+| One voice per speaker (optional) | `microsoft/wavlm-base-plus-sv` voice prints via `transformers` (CC BY-SA 3.0, not gated, about 400 MB), clustered with numpy; pitch picks female or male | Local; only with `speakers=true`; a few seconds per video |
 
 **Environment variables (Python `.env`)**
 
@@ -50,6 +52,8 @@ WORK_DIR=/data/jobs
 MAX_VIDEO_MINUTES=15
 ORIGINAL_VOLUME=0.15      # default for POST /jobs without original_volume, 0 to 1; the site always sends it
 KHMER_SPACES=keep         # keep | remove the spaces NLLB puts between Khmer words
+SPEAKER_THRESHOLD=0.85    # voice-print similarity for two lines to count as one speaker
+MAX_SPEAKERS=6
 ```
 
 **Laravel `.env` additions**
@@ -58,6 +62,9 @@ KHMER_SPACES=keep         # keep | remove the spaces NLLB puts between Khmer wor
 DUBBER_URL=http://worker:8001
 DUBBER_TOKEN=change-me
 QUEUE_CONNECTION=database
+BROADCAST_CONNECTION=reverb   # null turns live progress off
+REVERB_APP_ID=...             # REVERB_APP_KEY and REVERB_APP_SECRET too: random values
+REVERB_PUBLIC_PORT=8080       # where the browser reaches Reverb, on the page's own host name
 ```
 
 The two tokens must match.
@@ -70,7 +77,7 @@ Use one Git repository with two separate apps in two folders. Each app keeps its
 khmer-dub/
   CLAUDE.md                  # this guideline
   README.md                  # setup and run instructions (keep updated)
-  compose.yaml               # services: web, queue, scheduler, mysql, worker
+  compose.yaml               # services: web, queue, scheduler, reverb, mysql, worker, mailpit
   .gitignore
   web/                       # Laravel app
     Dockerfile
@@ -129,12 +136,13 @@ Everything runs in containers. The developer needs only Git and Docker (Docker E
 | `scheduler` | same image as `web` | `php artisan schedule:work` (runs `dub:cleanup` daily) | none |
 | `mysql` | official `mysql` image, latest LTS tag | database | none |
 | `worker` | official `python` slim image (3.14, or 3.13 if needed) plus FFmpeg | FastAPI worker | none |
+| `reverb` | same image as `web` | `php artisan reverb:start --port=8080`, live progress for the page | 8080 on 127.0.0.1 only |
 | `mailpit` | `axllent/mailpit` (MIT) | catches the site's email (password reset links) | 8025 on 127.0.0.1 only |
 
 **Rules**
 
 1. Use one root `compose.yaml` (Compose v2, no `version:` key) and one network. Laravel reaches the worker at `http://worker:8001` and MySQL at host `mysql`.
-2. Never publish the worker port to the host. Only the site on port 8000 is reachable from outside.
+2. Never publish the worker port to the host. Only the site on port 8000 is reachable from outside; Reverb (8080) and Mailpit (8025) are published to 127.0.0.1 only.
 3. Use the latest stable versions at the time of building: the newest Laravel, the newest FastAPI, and the newest Python for which every package installs. Try Python 3.14 first. If a package such as `ctranslate2`, `sentencepiece` or `torch` has no build for it, use 3.13 and write the reason in the README. Check versions with `composer show` and `pip index versions <name>`.
 4. After the first successful build, pin the resolved Python package versions in `worker/requirements.txt`, commit `web/composer.lock`, and pin the image tags, so the next build is repeatable.
 5. Worker image: install FFmpeg with `apt`, install CPU-only PyTorch from `https://download.pytorch.org/whl/cpu` before the other packages to keep the image small, run as a non-root user, and start with `uvicorn app:app --host 0.0.0.0 --port 8001`.
@@ -165,10 +173,11 @@ Both apps must follow this contract exactly. Every request to the worker carries
 
 | Method and path | Sends | Returns |
 | --- | --- | --- |
-| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`), `original_volume` (0 to 1, how loud the original sound plays under the Khmer voice; 0 = off, default `ORIGINAL_VOLUME`), `language` (the spoken language as a Whisper code; empty or left out = detect it), `separate` (`true` or `false`, default `false`: take the speech out of the original sound, keeping music and effects) | `{"job_id": "<hex>"}` |
+| `POST /jobs` | multipart: `file`, `gender` (`male` or `female`), `dub` (`true` or `false`), `review` (`true` or `false`, default `false`), `original_volume` (0 to 1, how loud the original sound plays under the Khmer voice; 0 = off, default `ORIGINAL_VOLUME`), `language` (the spoken language as a Whisper code; empty or left out = detect it), `separate` (`true` or `false`, default `false`: take the speech out of the original sound, keeping music and effects), `speakers` (`true` or `false`, default `false`: find who says each line and give each speaker a voice), `glossary` (JSON `[{"term", "km"}]`, at most 500; empty `km` keeps the term as written), `memory` (JSON `[{"language", "text", "km"}]`, at most 5000: Khmer a person wrote for a line before) | `{"job_id": "<hex>"}` |
 | `GET /jobs/{id}` | nothing | `{"status", "progress", "message", "error", "language", "done", "total"}` |
-| `GET /jobs/{id}/segments` | nothing | `{"segments": [{"id", "start", "end", "text", "km"}]}` while the job is in `review` or `done` |
-| `PUT /jobs/{id}/segments` | JSON: `{"segments": [{"id", "km"}]}`, optional `gender` and `original_volume` | `{"status": "queued"}` after saving the Khmer and choices and resuming the job; lines left out keep their text, choices left out stay, and an empty line is dropped |
+| `GET /jobs/{id}/segments` | nothing | `{"segments": [{"id", "start", "end", "text", "km", "speaker", "reused"}], "speakers": [{"id", "gender", "lines"}]}` while the job is in `review` or `done`; `speaker` is null and `speakers` empty without `speakers=true`; `reused` is true for a line whose Khmer came from `memory` |
+| `PUT /jobs/{id}/segments` | JSON: `{"segments": [{"id", "km", "speaker"}]}` (`speaker` optional: move the line to that speaker), optional `gender`, `original_volume` and `speakers` (`[{"id", "gender"}]`, each speaker's voice) | `{"status": "queued"}` after saving the Khmer and choices and resuming the job; lines left out keep their text, choices left out stay, and an empty line is dropped |
+| `POST /jobs/{id}/voice` | JSON: `{"text"}`, optional `gender`, `speaker` and `speakers` (`[{"id", "gender"}]`, the choices on the review page not saved yet) | the line's Khmer voice as `audio/wav`, with header `x-clip-seconds`; only for a dubbed job in `review` or `done` (else 409); 422 for text with nothing Khmer to say, 503 if the voice service is down. The clip is kept, so saving the line uses it |
 | `POST /jobs/{id}/reopen` | multipart: `file` (the original video) | `{"status": "review"}`, putting a `done` job back in review to make its results again; also accepted in `review`, so a refused save can be sent again |
 | `POST /jobs/{id}/cancel` | nothing | `{"status": <status now>}`, stopping a queued or running job: `cancelled`, or `review` for a job past its review, once it has stopped; `queued` or `processing` while a running job gets to its next step |
 | `DELETE /jobs/{id}` | nothing | `{"status": "deleted"}` after deleting a job that is not queued or running, with its folder |
@@ -178,7 +187,7 @@ Both apps must follow this contract exactly. Every request to the worker carries
 
 **Status values**: `queued`, `processing`, `review`, `done`, `failed`, `cancelled`. `review` means a job sent with `review=true` has stopped after translation, or a finished job was reopened, until its Khmer is saved; it holds no worker thread. `progress` is an integer from 0 to 100. On failure, `error` holds a short human-readable reason. `language` is the detected spoken language as a Whisper code (for example `en`), or null until the Khmer is ready (`review` or `done`); Laravel stores it in `video_jobs.language`.
 
-**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge (with `separate=true`: 85 remove the original speech, 92 mix and merge), 100 done. Inside the long steps the progress moves on, and `done` and `total` say how far the step is: seconds of the video while transcribing or removing the speech, lines while translating or making the voice. Otherwise they are null.
+**Progress milestones**: 5 extract audio, 15 transcribe, 45 translate, 38 find the speakers (only with `speakers=true`), 50 waiting for review (only with `review=true`), 60 voice, 85 mix and merge (with `separate=true`: 85 remove the original speech, 92 mix and merge), 100 done. Inside the long steps the progress moves on, and `done` and `total` say how far the step is: seconds of the video while transcribing or removing the speech, lines while finding the speakers, translating or making the voice. Otherwise they are null.
 
 **Error cases the worker must handle with a clear message**: missing file, unsupported format, video longer than `MAX_VIDEO_MINUTES`, no speech found, FFmpeg not installed, model download failed, TTS service unreachable. Return HTTP 401 for a wrong token, 404 for an unknown job, 409 for a review call on a job that is not in review, a reopen of a job that cannot be edited, a cancel of a job that is not queued or running, or a delete of one that is, 422 for bad input. A restart puts a queued or running job back in line once, in its old order, going on from its last saved step (the voice once the Khmer is ready). A failure after the review, or a second restart of the same run, sends the job back to `review` with `error` set, so the edits are kept and saving retries it; before the review it fails. A job cancelled after its review also goes back to `review`, without an error.
 
@@ -203,6 +212,13 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 - Skip empty segments. Raise a clear error if no speech is found.
 - Join a line to the next when the sentence clearly continues (the line ends in a comma or similar, or the next starts in lowercase), so it is translated whole. Never join lines more than 2.5 s apart or into a line longer than 12 s.
 
+**Stage 2b: `speakers.py`** (only with `speakers=true`)
+
+- `find_speakers(wav_path, segments)` sets `speaker` (0, 1, ... in order of first appearance) on every segment and returns `[{"id", "gender", "lines"}]`, saved as `speakers.json`.
+- One WavLM voice print per line of at least 1 s; average-linkage clustering on cosine similarity (`SPEAKER_THRESHOLD`, at most `MAX_SPEAKERS`); a group with under 3 s of speech joins the most alike bigger one; shorter lines take the speaker of the nearest line.
+- The median pitch of each speaker picks the voice: under 165 Hz male, else female. A person can change both in review.
+- Stage 4 gives speakers with the same voice a pitch shift of 0, -2, +2, -3, +3, -1 semitones, in that order, so they sound apart.
+
 **Stage 3: `translate.py`**
 
 - `translate(segments, src_lang)` fills `km` for every segment using NLLB-200 with target `khm_Khmr`.
@@ -211,13 +227,16 @@ The worker runs five stages in order. Each stage is one file in `worker/stages/`
 - Raise a clear error if no translated line contains Khmer letters.
 - Translate in batches of 8 to 16 segments to save time. Load the model once. Remove the spaces between Khmer words only with `KHMER_SPACES=remove`.
 - Never call any online translation service.
+- `translate(segments, src_lang, on_step, glossary, memory)`: a line whose text matches a `memory` entry of the same language (ignoring case, spacing and the final punctuation) gets that Khmer without the model and `reused: true`. Glossary terms (whole words, any case, longest first) are replaced by markers `[1]`, `[2]`, ... before NLLB and by their Khmer (or the term as written) after; a line whose markers were lost is translated again without them. The worker keeps both only in the job folder (`terms.json`) until the job ends.
+- Do not translate a line together with its neighbours: tried in Phase 9, NLLB 600M then wrote Sinhala letters into Khmer words, cut words short and swapped lines.
 
 **Stage 4: `tts.py`**
 
 - `synth(text, out_path, gender)` hides the engine behind the `TTS_ENGINE` setting: `edge` uses `edge-tts` with `km-KH-SreymomNeural` (female) or `km-KH-PisethNeural` (male); `mms` uses `facebook/mms-tts-khm` locally.
 - Add `synth_all(segments, folder, gender)` that writes one clip per segment and sets `clip`. Skip segments whose `km` is empty.
-- Retry `edge-tts` twice on failure. If it still fails and `TTS_ENGINE=edge`, raise an error that tells the developer to switch to `mms`.
+- Retry `edge-tts` twice on a network failure. If it still fails and `TTS_ENGINE=edge`, raise an error that tells the developer to switch to `mms`. Its "no audio received" answer comes at random for 7 to 37% of ordinary lines at busy times, so try that up to 10 times (`EDGE_NO_AUDIO_TRIES`), 1 s apart, before saying the voice could not read the line.
 - Convert every clip to WAV 24 kHz mono before it leaves this stage, so Stage 5 handles one format.
+- Name each clip by a hash of the engine, voice, pitch and Khmer text (`clip_path`), and reuse a clip already in the folder (`cached_clip`), so making a job again only voices the lines that changed. The clips folder stays after the job ends; `pipeline.finish` deletes the clips no line uses.
 
 **Stage 5: `mix.py`**
 
@@ -253,6 +272,7 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `original_volume` | decimal(3,2) | default 0; original sound under the voice, 0 (off) to 1 |
 | `spoken_language` | string, nullable | the spoken language chosen on the form, a Whisper code; null = detect it |
 | `separate` | boolean | default false; take the original speech out of the sound under the voice |
+| `speakers` | boolean | default false; find who says each line and give each speaker a voice |
 | `status` | string | `queued`, `processing`, `review`, `done`, `failed`, `cancelled` |
 | `progress` | tinyint | 0 to 100 |
 | `message` | string, nullable | current step text |
@@ -263,7 +283,9 @@ Laravel stores uploads, queues the work, tracks progress, and serves results. It
 | `error` | text, nullable | failure reason |
 | `cancel_requested` | boolean | default false; a person asked to stop the job and the worker has not stopped yet |
 
-`users` also has `dub_options` (JSON, nullable): the user's latest choices on the upload form (`gender`, `dub`, `review`, `original_volume`, `separate`), saved as soon as one changes. The form starts from them. They stay after cleanup deletes the user's jobs.
+`users` also has `glossary` (JSON, nullable, `[{"term", "km"}]`, edited on `/glossary` as one `term = Khmer` a line), and the table `translation_memories` (`user_id`, `language`, `source`, `source_key` = sha1 of the line without case and extra spaces, `km`; unique per user, language and key) keeps the Khmer of each line a person changed on the review page. `ProcessVideoJob` sends the glossary and the newest 2000 remembered lines with every upload.
+
+`users` also has `dub_options` (JSON, nullable): the user's latest choices on the upload form (`gender`, `dub`, `review`, `original_volume`, `separate`, `speakers`), saved as soon as one changes. The form starts from them. They stay after cleanup deletes the user's jobs.
 
 **Files and responsibilities**
 
@@ -284,11 +306,15 @@ GET  /dub/{job}/review           review (page)
 POST /dub/{job}/review           saveReview
 GET  /dub/{job}/download/{kind}  download (kind = srt | video)
 GET  /dub/{job}/preview/{kind}   preview (kind = video | vtt), inline for the player
+POST /dub/{job}/voice            voice (one line's Khmer voice for the review page, throttled to 30 a minute)
+GET  /glossary                   GlossaryController@edit (the glossary and the count of remembered edits)
+PUT  /glossary                   GlossaryController@update
+DELETE /glossary/memory          GlossaryController@forget (forget the remembered edits)
 ```
 
 **Validation**: video required, `mimes:mp4,mov,mkv,webm`, maximum 512000 KB, `gender` in `male,female`, `dub` boolean, `review` boolean, `original_volume` number from 0 to 1.
 
-**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, an original sound slider (0 to 100%, starts at Off, shown only when dubbing), a progress bar, a status message, the current step with how far it is, which unfolds into the list of all the job's steps when clicked, a cancel button with a confirmation dialog while the job can still be stopped, a delete button with a confirmation dialog on every stopped video, a video player with the Khmer subtitles and a close button that shows a dubbed result when done, a Play link on every dubbed video in the history, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
+**UI (`dub/index.blade.php`)**: one page with a file input, a voice select, a dub checkbox, an original sound slider (0 to 100%, starts at Off, shown only when dubbing), a progress bar, a status message, the current step with how far it is, which unfolds into the list of all the job's steps when clicked, a cancel button with a confirmation dialog while the job can still be stopped, a delete button with a confirmation dialog on every stopped video, a video player with the Khmer subtitles and a close button that shows a dubbed result when done, a Play link on every dubbed video in the history, and download links that appear when done. Use plain `fetch` and `setTimeout` polling every 3 seconds, except while the page gets the job's progress live from Reverb (`App\Events\VideoJobUpdated` on the private channel `users.{id}`, sent at once whenever a job's progress columns change; a failed send pauses sending for a minute and never fails the job). While live, a running job is only asked for when it stops, or after 30 s without an event. Show the interface in English or Khmer, one at a time, with a switch on every page; all Khmer text is in `web/lang/km.json`. Keep the page simple; do not add React, Tailwind builds or npm packages for the first version.
 
 **Security basics**: add Laravel Breeze (free) for login in the last phase, then make `status`, `cancel`, `destroy`, `download` and `preview` check `job->user_id === auth()->id()`. Never expose the worker port outside the machine.
 
@@ -306,6 +332,10 @@ Build in this order. Finish and test each phase before starting the next, and co
 | 5 | FastAPI app, `/health` and job status | The contract calls work from the `web` container with `curl`, and `docker compose run --rm worker pytest` passes | 3 to 4 |
 | 6 | Laravel: migration, controller, queue job, Blade page | Upload at `http://localhost:8000`, see the progress bar move, download both files | 6 to 10 |
 | 7 | Login (Breeze), ownership checks, cleanup command, error messages, README | A second user cannot open the first user's job; old files are deleted; a fresh clone starts with only the README steps | 5 to 8 |
+| 8 | One voice per speaker: `speakers.py`, pitch variants in `tts.py`, the upload switch, speakers on the review page | A video with two women and a man gets three speakers with the right voices; a line can be moved to another speaker in review | 6 to 8 |
+| 9 | Glossary (names and terms kept or forced) and a memory of review edits reused for the same line in later videos; NLLB 600M stays. Translating with neighbouring lines was tried and dropped (it broke the Khmer) | Names in the glossary come out as written; a corrected line comes back in the next video with the same line | 5 to 7 |
+| 10 | Hear one line's voice on the review page before saving (with its real length against its room), and keep the clips so making a job again only voices the changed lines | Changing one line remakes only that clip, and the player plays the new voice | 5 to 7 |
+| 11 | Live progress with Laravel Reverb (MIT, self-hosted) instead of polling, polling kept as the fallback; a plain-JS client, no npm | The progress bar moves without polling requests; with Reverb stopped the page still works | 4 to 6 |
 
 The hours are estimates for working with Claude Code. Phase 4 and the Khmer quality check in Phase 2 are the ones most likely to run over.
 
@@ -341,6 +371,7 @@ The hours are estimates for working with Claude Code. Phase 4 and the Khmer qual
 - `edge-tts` is unofficial and needs internet. It may change or stop working. `mms` is the offline fallback.
 - CPU transcription is slow, roughly a few minutes for a 10 minute video with the `small` model.
 - Only use videos the user owns or may translate; label dubbed videos as AI-generated voice.
+- Speakers are a guess from voice prints: people who sound alike can be merged, one person in different rooms can be split, and talking over each other is not handled. There are only two Khmer voices, so extra speakers differ by pitch only.
 
 **Definition of done for the whole project**
 

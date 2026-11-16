@@ -1,0 +1,23 @@
+# Share the site from this computer through a free Cloudflare quick tunnel (no account, no router change).
+# Start: docker compose -f compose.yaml -f compose.tunnel.yaml up --build -d
+# Public address: docker compose -f compose.yaml -f compose.tunnel.yaml logs cloudflared | grep trycloudflare.com
+# The address is random and changes every time cloudflared restarts. Cloudflare's free proxy refuses
+# uploads over 100 MB. The worker, MySQL and Mailpit stay inside the Compose network.
+
+services:
+  web:
+    # The tunnel reaches web inside the network. Port 8000 stays open for this computer only, so
+    # nobody else on the local network can send forged X-Forwarded headers.
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    environment:
+      # cloudflared ends HTTPS and says so in X-Forwarded-Proto, so the site's links use https.
+      TRUSTED_PROXIES: "*"
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.7 # latest when added; Apache-2.0 licence
+    command: ["tunnel", "--no-autoupdate", "--url", "http://web:8000"]
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped

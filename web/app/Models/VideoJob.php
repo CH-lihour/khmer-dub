@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Support\LiveUpdates;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Storage;
@@ -19,6 +20,9 @@ use Locale;
  * @property bool $dub
  * @property bool $review
  * @property float $original_volume
+ * @property string|null $spoken_language
+ * @property bool $separate
+ * @property bool $speakers
  * @property string $status
  * @property int $progress
  * @property string|null $message
@@ -64,7 +68,7 @@ class VideoJob extends Model
 
     /** @var list<string> */
     protected $fillable = [
-        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'original_volume', 'spoken_language', 'separate', 'status', 'progress',
+        'user_id', 'original_name', 'path', 'gender', 'dub', 'review', 'original_volume', 'spoken_language', 'separate', 'speakers', 'status', 'progress',
         'message', 'step_done', 'step_total', 'language', 'worker_job_id', 'srt_path', 'video_path', 'error', 'cancel_requested',
     ];
 
@@ -75,17 +79,33 @@ class VideoJob extends Model
         'review' => false,
         'original_volume' => 0,
         'separate' => false,
+        'speakers' => false,
         'status' => self::QUEUED,
         'progress' => 0,
         'cancel_requested' => false,
     ];
+
+    /** The columns the page shows while a job runs; a change to one goes to the page live. */
+    private const LIVE = ['status', 'progress', 'message', 'step_done', 'step_total', 'cancel_requested'];
+
+    /**
+     * Send each change of a job's progress to its owner's page (App\Support\LiveUpdates).
+     */
+    protected static function booted(): void
+    {
+        static::updated(function (VideoJob $job) {
+            if ($job->wasChanged(self::LIVE)) {
+                LiveUpdates::send($job);
+            }
+        });
+    }
 
     /**
      * @return array<string, string>
      */
     protected function casts(): array
     {
-        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'separate' => 'boolean', 'progress' => 'integer', 'step_done' => 'integer', 'step_total' => 'integer', 'cancel_requested' => 'boolean'];
+        return ['user_id' => 'integer', 'dub' => 'boolean', 'review' => 'boolean', 'original_volume' => 'float', 'separate' => 'boolean', 'speakers' => 'boolean', 'progress' => 'integer', 'step_done' => 'integer', 'step_total' => 'integer', 'cancel_requested' => 'boolean'];
     }
 
     /**

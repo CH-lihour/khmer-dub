@@ -1,0 +1,45 @@
+# Server settings on top of compose.yaml (Oracle Cloud VM or any Linux server with Docker).
+# Start: docker compose -f compose.yaml -f compose.prod.yaml up --build -d
+# Caddy is the only public service: it gets a free HTTPS certificate for SITE_ADDRESS and passes
+# requests to web. The web port 8000, the worker and MySQL stay inside the Compose network.
+
+x-prod-env: &prod-env
+  APP_ENV: production
+  APP_DEBUG: "false"
+  LOG_LEVEL: info
+  TRUSTED_PROXIES: "*"
+  SESSION_SECURE_COOKIE: "true"
+
+services:
+  web:
+    ports: !reset []
+    environment:
+      <<: *prod-env
+
+  queue:
+    environment:
+      <<: *prod-env
+
+  scheduler:
+    environment:
+      <<: *prod-env
+
+  caddy:
+    image: caddy:2.11.9 # latest when added; Apache-2.0 licence
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS in .env, e.g. 140-238-1-2.sslip.io}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/server/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

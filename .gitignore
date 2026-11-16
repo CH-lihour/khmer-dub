@@ -19,6 +19,9 @@ worker/samples/
 __pycache__/
 .pytest_cache/
 
+# Hugging Face Space folder, made by deploy/hf-space/build.sh
+build/
+
 # Windows copy artifacts
 *:Zone.Identifier
 

@@ -3,8 +3,10 @@
 namespace App\Http\Controllers;
 
 use App\Jobs\ProcessVideoJob;
+use App\Models\TranslationMemory;
 use App\Models\User;
 use App\Models\VideoJob;
+use App\Support\LiveUpdates;
 use App\Support\Worker;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
@@ -41,6 +43,7 @@ class VideoJobController extends Controller
         'review' => ['sometimes', 'boolean'],
         'original_volume' => ['sometimes', 'numeric', 'between:0,1'],
         'separate' => ['sometimes', 'boolean'],
+        'speakers' => ['sometimes', 'boolean'],
     ];
 
     /**
@@ -74,6 +77,8 @@ class VideoJobController extends Controller
             'filtered' => $search !== '' || $status !== '',
             'current' => $current ? $this->statusData($current) : null,
             'options' => $request->user()->dubOptions(),
+            'live' => LiveUpdates::pageConfig($request->user()),
+            'liveMessages' => LiveUpdates::messages(),
         ]);
     }
 
@@ -113,6 +118,7 @@ class VideoJobController extends Controller
             'original_volume' => $data['original_volume'] ?? 0,
             'spoken_language' => $data['spoken_language'] ?? null,
             'separate' => $request->boolean('dub') && $request->boolean('separate'), // only a voice has sound under it
+            'speakers' => $request->boolean('dub') && $request->boolean('speakers'), // voices only matter when dubbing
             'message' => 'Waiting in the queue',
         ]);
         ProcessVideoJob::dispatch($job);
@@ -242,7 +248,47 @@ class VideoJobController extends Controller
             return redirect()->route('dub.index', ['job' => $job->id])->withErrors(['review' => Worker::say($this->workerError($response))]);
         }
 
-        return view('dub.review', ['job' => $job, 'segments' => $response->json('segments')]);
+        return view('dub.review', ['job' => $job, 'segments' => $response->json('segments'), 'speakers' => $response->json('speakers') ?? []]);
+    }
+
+    /**
+     * Make the Khmer voice of one line on the review page, before saving, and send it as a WAV.
+     *
+     * The voice choices on the page (the job's voice, the line's speaker and the speakers' voices)
+     * go with it, so it sounds as it will after saving. The header X-Clip-Seconds says how long it is.
+     * The worker keeps the clip, so saving the line does not make it again.
+     */
+    public function voice(Request $request, VideoJob $job): HttpResponse
+    {
+        $this->authorizeOwner($request, $job);
+        if (! $job->canEdit() || ! $job->dub) {
+            return response()->json(['message' => __('This video has no Khmer voice to play.')], 409);
+        }
+        $data = $request->validate([
+            'text' => ['required', 'string', 'max:2000'],
+            'gender' => self::OPTION_RULES['gender'],
+            'speaker' => ['nullable', 'integer', 'min:0'],
+            'voices' => ['sometimes', 'array'],
+            'voices.*' => ['in:male,female'],
+        ]);
+
+        try {
+            $response = Worker::client()->timeout(60)->post("/jobs/{$job->worker_job_id}/voice", [
+                'text' => $data['text'], 'gender' => $data['gender'] ?? $job->gender,
+                'speaker' => isset($data['speaker']) ? (int) $data['speaker'] : null,
+                'speakers' => collect($data['voices'] ?? [])->map(fn (string $gender, int|string $id) => ['id' => (int) $id, 'gender' => $gender])->values()->all(),
+            ]);
+        } catch (ConnectionException) {
+            return response()->json(['message' => Worker::say(Worker::UNREACHABLE)], 503);
+        }
+        if (! $response->successful()) {
+            return response()->json(['message' => Worker::say($this->workerError($response))], $response->status() === 422 ? 422 : 503);
+        }
+
+        return response($response->body(), 200, [
+            'Content-Type' => 'audio/wav', 'Cache-Control' => 'no-store',
+            'X-Clip-Seconds' => (string) (float) $response->header('x-clip-seconds'),
+        ]);
     }
 
     /**
@@ -263,18 +309,34 @@ class VideoJobController extends Controller
             'km.*' => ['nullable', 'string', 'max:2000'],
             'gender' => self::OPTION_RULES['gender'],
             'original_volume' => self::OPTION_RULES['original_volume'],
+            'speaker' => ['sometimes', 'array'],
+            'speaker.*' => ['integer', 'min:0'],
+            'voices' => ['sometimes', 'array'],
+            'voices.*' => ['in:male,female'],
+            // Each line's original text and its Khmer as the page showed it, so the lines a person
+            // changed can be remembered for later videos.
+            'text' => ['sometimes', 'array'],
+            'text.*' => ['nullable', 'string', 'max:2000'],
+            'was' => ['sometimes', 'array'],
+            'was.*' => ['nullable', 'string', 'max:2000'],
         ], [
             'km.*.max' => __('A line can have at most 2000 characters.'),
             'gender.in' => __('Choose the female or the male voice.'),
+            'voices.*.in' => __('Choose the female or the male voice.'),
+            'speaker.*' => __('Choose a speaker from the list.'),
             'original_volume.*' => __('Choose an original sound level from 0 to 100%.'),
         ]);
-        $lines = collect($data['km'])->map(fn (?string $text, int|string $id) => ['id' => (int) $id, 'km' => (string) $text]);
+        $speakerOf = $data['speaker'] ?? [];
+        $lines = collect($data['km'])->map(fn (?string $text, int|string $id) => ['id' => (int) $id, 'km' => (string) $text]
+            + (isset($speakerOf[$id]) ? ['speaker' => (int) $speakerOf[$id]] : []));
         $choices = ['gender' => $data['gender'] ?? $job->gender, 'original_volume' => (float) ($data['original_volume'] ?? $job->original_volume)];
+        $voices = collect($data['voices'] ?? [])->map(fn (string $gender, int|string $id) => ['id' => (int) $id, 'gender' => $gender])->values()->all();
 
         try {
             $response = $job->status === VideoJob::DONE ? $this->reopen($job) : null;
             if ($response === null || $response->successful()) {
-                $response = Worker::client()->put("/jobs/{$job->worker_job_id}/segments", ['segments' => $lines->values()->all(), ...$choices]);
+                $response = Worker::client()->put("/jobs/{$job->worker_job_id}/segments",
+                    ['segments' => $lines->values()->all(), ...$choices] + ($voices ? ['speakers' => $voices] : []));
             }
         } catch (ConnectionException) {
             return back()->withInput()->withErrors(['review' => Worker::say(Worker::UNREACHABLE)]);
@@ -290,6 +352,10 @@ class VideoJobController extends Controller
         };
         $job->update(['status' => VideoJob::QUEUED, 'progress' => 50, 'message' => 'Waiting in the queue', 'error' => null, 'cancel_requested' => false, ...$choices]);
         ProcessVideoJob::dispatch($job);
+        if ($job->language !== null && $job->language !== 'km') { // a Khmer video is copied, not translated
+            TranslationMemory::remember($request->user(), $job->language, collect($data['km'])
+                ->map(fn (?string $km, int|string $id) => [(string) ($data['text'][$id] ?? ''), (string) ($data['was'][$id] ?? ''), (string) $km]));
+        }
 
         return redirect()->route('dub.index', ['job' => $job->id])->with('notice', $notice);
     }
@@ -371,6 +437,7 @@ class VideoJobController extends Controller
             'original_volume' => (float) $request->input('original_volume', $user->dubOptions()['original_volume']),
             // Sent only while dubbing, like the level, so the choice stays while dubbing is off.
             'separate' => $request->has('original_volume') ? $request->boolean('separate') : $user->dubOptions()['separate'],
+            'speakers' => $request->has('original_volume') ? $request->boolean('speakers') : $user->dubOptions()['speakers'],
         ]])->save();
     }
 
@@ -432,6 +499,7 @@ class VideoJobController extends Controller
             'language_name' => $job->languageName(),
             'dub' => $job->dub,
             'separate' => $job->separate && $job->original_volume > 0, // the worker skips it with the sound off
+            'speakers' => $job->speakers,
             'status_url' => route('dub.status', $job),
             'cancel_url' => $job->isRunning() && ! $cancelling && $job->progress < 99 ? route('dub.cancel', $job) : null, // at 99 only the download is left
             'cancel_keeps_edits' => $job->language !== null, // known once the Khmer is ready, so past any review

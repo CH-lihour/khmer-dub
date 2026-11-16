@@ -34,6 +34,13 @@ return [
         'token' => env('DUBBER_TOKEN'),
     ],
 
+    // Where the browser reaches Reverb for live progress: the page's own host name on this port.
+    // The site reaches it inside Docker at REVERB_HOST:REVERB_PORT (config/broadcasting.php).
+    'reverb_client' => [
+        'port' => (int) env('REVERB_PUBLIC_PORT', 8080),
+        'scheme' => env('REVERB_PUBLIC_SCHEME', 'ws'),
+    ],
+
     'slack' => [
         'notifications' => [
             'bot_user_oauth_token' => env('SLACK_BOT_USER_OAUTH_TOKEN'),

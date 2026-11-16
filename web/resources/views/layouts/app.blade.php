@@ -10,6 +10,7 @@
         <a class="brand" href="{{ route('dub.index') }}" aria-label="Khmer Dub"><x-logo /> <span class="brand-name">Khmer Dub</span></a>
         <div class="account">
             <x-language />
+            <a class="glossary-link" href="{{ route('glossary.edit') }}">{{ __('Glossary') }}</a>
             <a class="person" href="{{ route('profile.edit') }}" title="{{ Auth::user()->name }}" aria-label="{{ __('Account') }}">
                 <span class="avatar" aria-hidden="true">{{ mb_strtoupper(mb_substr(Auth::user()->name, 0, 1)) }}</span>
             </a>

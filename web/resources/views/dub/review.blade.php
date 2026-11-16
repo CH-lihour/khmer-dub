@@ -19,6 +19,7 @@
         @endif
 
         <form id="review" method="post" action="{{ route('dub.review.save', $job) }}" data-edited="{{ $errors->any() ? 'yes' : '' }}"
+              data-voice-url="{{ route('dub.voice', $job) }}"
               data-dub="{{ $job->dub ? 'yes' : '' }}">
             @csrf
             {{-- The upload, not the dubbed video: the times below are the original speech. --}}
@@ -26,6 +27,21 @@
                 <video id="player" controls playsinline preload="metadata" src="{{ route('dub.preview', [$job, 'original']) }}"></video>
                 <p id="player-error" class="hint" hidden>{{ __('This browser cannot play the uploaded video. Keep it open in another player next to this page.') }}</p>
             </div>
+            @if ($job->dub && $speakers)
+                {{-- Found by the worker's voice prints; a person can correct both the voice and who says a line. --}}
+                <div class="panel speakers">
+                    <h2>{{ __('Speakers') }}</h2>
+                    <p class="hint">{{ __('Who says each line was guessed from their voices. Change a line\'s speaker below if it is wrong.') }}</p>
+                    @foreach ($speakers as $speaker)
+                        <fieldset class="speaker" data-speaker="{{ $speaker['id'] }}">
+                            <legend>{{ __('Speaker :number', ['number' => $speaker['id'] + 1]) }} <small class="hint">{{ trans_choice(':count line|:count lines', $speaker['lines'], ['count' => $speaker['lines']]) }}</small></legend>
+                            @foreach (['female' => __('Sreymom'), 'male' => __('Piseth')] as $gender => $name)
+                                <label><input type="radio" name="voices[{{ $speaker['id'] }}]" value="{{ $gender }}" @checked(old('voices.'.$speaker['id'], $speaker['gender']) === $gender)> {{ $name }} <small>{{ $gender === 'female' ? __('Female') : __('Male') }}</small></label>
+                            @endforeach
+                        </fieldset>
+                    @endforeach
+                </div>
+            @endif
             <ol class="panel lines">
                 @foreach ($segments as $i => $seg)
                     <li class="line" data-start="{{ $seg['start'] }}" data-end="{{ $seg['end'] }}" data-next="{{ $segments[$i + 1]['start'] ?? '' }}">
@@ -33,9 +49,27 @@
                             <button class="play-line" type="button" title="{{ __('Play this line') }}">▶ {{ $clock($seg['start']) }} – {{ $clock($seg['end']) }}</button>
                             <span class="original">{{ $seg['text'] }}</span>
                         </label>
+                        @if ($job->dub && $speakers && isset($seg['speaker']))
+                            <select class="speaker-pick" name="speaker[{{ $seg['id'] }}]" aria-label="{{ __('Speaker') }}" data-speaker="{{ old('speaker.'.$seg['id'], $seg['speaker']) }}">
+                                @foreach ($speakers as $speaker)
+                                    <option value="{{ $speaker['id'] }}" @selected((int) old('speaker.'.$seg['id'], $seg['speaker']) === $speaker['id'])>{{ __('Speaker :number', ['number' => $speaker['id'] + 1]) }}</option>
+                                @endforeach
+                            </select>
+                        @endif
                         <div>
                             <textarea id="km-{{ $seg['id'] }}" name="km[{{ $seg['id'] }}]" lang="km" rows="3" maxlength="2000">{{ old('km.'.$seg['id'], $seg['km']) }}</textarea>
-                            <p class="fit" aria-live="polite"></p>
+                            {{-- What the line said and held, so the lines changed here are remembered for later videos. --}}
+                            <input type="hidden" name="text[{{ $seg['id'] }}]" value="{{ $seg['text'] }}">
+                            <input type="hidden" name="was[{{ $seg['id'] }}]" value="{{ $seg['km'] }}">
+                            @if (! empty($seg['reused']))
+                                <p class="hint reused">{{ __('Your Khmer from an earlier video') }}</p>
+                            @endif
+                            <div class="line-tools">
+                                @if ($job->dub)
+                                    <button class="listen-line" type="button" title="{{ __('Listen to the Khmer voice') }}">🔊 {{ __('Listen') }}</button>
+                                @endif
+                                <p class="fit" aria-live="polite"></p>
+                            </div>
                             @error('km.'.$seg['id'])<p class="field-error">{{ $message }}</p>@enderror
                         </div>
                     </li>
@@ -44,7 +78,9 @@
 
             @if ($job->dub)
                 <div class="panel">
-                    <x-voice-choice :selected="old('gender', $job->gender)" />
+                    @unless ($speakers)
+                        <x-voice-choice :selected="old('gender', $job->gender)" />
+                    @endunless
                     <x-original-sound :level="(float) old('original_volume', $job->original_volume)" />
                 </div>
             @endif
@@ -143,24 +179,98 @@
          * edge-tts says about 15 Khmer letters a second, after a short start.
          */
         const FIT = { fast: @json(__('Long for its time: the voice will be sped up.')), cut: @json(__('Too long for its time: the end of the voice may be cut. Shorten it if you can.')) };
+        // Once a line has been heard, its real length replaces the guess.
+        const HEARD = {
+            '': @json(__('The voice is :voice s and fits its :room s.')),
+            fast: @json(__('The voice is :voice s for :room s, so it will be sped up ×:speed.')),
+            cut: @json(__('The voice is :voice s for :room s: even sped up ×1.6, its end will be cut. Shorten it if you can.')),
+        };
         const MAX_SPEED = 1.6;
         const speech = (text) => text.trim() ? .3 + text.replace(/\s/g, '').length / 15 : 0;
         function checkFit(line) {
             const box = line.querySelector('.fit'), start = Number(line.dataset.start);
             const until = Number(line.dataset.next) || player.duration || Number(line.dataset.end) + 1; // the last line has the rest of the video
-            const need = speech(line.querySelector('textarea').value), room = until - start;
+            const heard = line.dataset.seconds ? Number(line.dataset.seconds) : null;
+            const need = heard ?? speech(line.querySelector('textarea').value), room = until - start;
             const fit = need > room * MAX_SPEED ? 'cut' : need > room ? 'fast' : '';
             box.className = `fit ${fit}`;
-            box.textContent = FIT[fit] ?? '';
+            box.textContent = heard === null ? FIT[fit] ?? ''
+                : HEARD[fit].replace(':voice', heard.toFixed(1)).replace(':room', room.toFixed(1)).replace(':speed', (need / room).toFixed(2));
         }
         if (form.dataset.dub) {
             lines.forEach(checkFit);
             form.addEventListener('input', (event) => {
                 const line = event.target.closest('.line');
-                if (line) checkFit(line);
+                if (!line) return;
+                delete line.dataset.seconds; // the text changed, so the voice heard is not this one
+                checkFit(line);
+            });
+            // Another voice says a line at another length, so every length heard is a guess again.
+            form.addEventListener('change', (event) => {
+                if (!event.target.matches('input[type=radio], .speaker-pick')) return;
+                lines.forEach((line) => { delete line.dataset.seconds; checkFit(line); });
             });
             player.addEventListener('loadedmetadata', () => checkFit(lines[lines.length - 1]));
         }
+
+        /*
+         * 🔊 Listen on a line: the worker makes its Khmer voice as it will sound after saving (the
+         * voice and speaker chosen on the page now), and keeps it for the save. The same button stops it.
+         */
+        const voice = new Audio(), FAILED = @json(__('The voice could not be made. Try again.'));
+        let listening = null;
+        function stopListening() {
+            voice.pause();
+            if (voice.src) URL.revokeObjectURL(voice.src);
+            voice.removeAttribute('src');
+            listening?.classList.remove('playing');
+            listening = null;
+        }
+        voice.addEventListener('ended', stopListening);
+        form.addEventListener('click', async (event) => {
+            const button = event.target.closest('.listen-line');
+            if (!button) return;
+            const again = button === listening;
+            stopListening();
+            if (again) return;
+
+            const line = button.closest('.line'), body = new FormData();
+            body.append('_token', form.elements._token.value);
+            body.append('text', line.querySelector('textarea').value);
+            const gender = form.querySelector('input[name="gender"]:checked');
+            if (gender) body.append('gender', gender.value);
+            const pick = line.querySelector('.speaker-pick');
+            if (pick) body.append('speaker', pick.value);
+            form.querySelectorAll('input[name^="voices["]:checked').forEach((choice) => body.append(choice.name, choice.value));
+
+            button.disabled = true;
+            button.classList.add('busy');
+            try {
+                const response = await fetch(form.dataset.voiceUrl, { method: 'POST', body, headers: { Accept: 'application/json' } });
+                if (!response.ok) throw new Error((await response.json().catch(() => ({}))).message || FAILED);
+                line.dataset.seconds = response.headers.get('X-Clip-Seconds') || '';
+                checkFit(line);
+                voice.src = URL.createObjectURL(await response.blob());
+                player.pause(); // one sound at a time
+                listening = button;
+                button.classList.add('playing');
+                await voice.play();
+            } catch (error) {
+                stopListening();
+                const box = line.querySelector('.fit');
+                box.className = 'fit cut';
+                box.textContent = error.message || FAILED;
+            } finally {
+                button.disabled = false;
+                button.classList.remove('busy');
+            }
+        });
+        player.addEventListener('play', stopListening);
+
+        /** A line's speaker colour follows its picker. */
+        form.addEventListener('change', (event) => {
+            if (event.target.matches('.speaker-pick')) event.target.dataset.speaker = event.target.value;
+        });
 
         const level = $('original-volume'), label = $('original-level');
         const off = @json(__('Off'));

@@ -5,6 +5,7 @@
         ['from' => 0, 'label' => __('Sending the video to the worker')],
         ['from' => 5, 'label' => __('Extracting audio')],
         ['from' => 15, 'label' => __('Transcribing speech'), 'clock' => true],
+        ['from' => 38, 'label' => __('Finding the speakers'), 'speakers' => true],
         ['from' => 45, 'label' => __('Translating to Khmer')],
         ['from' => 60, 'label' => __('Making the Khmer voice'), 'voice' => true],
         ['from' => 85, 'label' => __('Mixing and merging'), 'voice' => true, 'separate' => false],
@@ -84,6 +85,10 @@
                 <label id="separate-row" @class(['toggle', 'off' => ! $dubbing])>
                     <input type="checkbox" name="separate" value="1" @checked($errors->any() ? old('separate') : $options['separate']) @disabled(! $dubbing)><i></i>
                     <span>{{ __('Remove the original speech') }} <small class="hint">{{ __('Keeps music and effects. Takes about half the video length longer.') }}</small></span>
+                </label>
+                <label id="speakers-row" @class(['toggle', 'off' => ! $dubbing])>
+                    <input type="checkbox" name="speakers" value="1" @checked($errors->any() ? old('speakers') : $options['speakers']) @disabled(! $dubbing)><i></i>
+                    <span>{{ __('One voice per speaker') }} <small class="hint">{{ __('Finds who says each line and gives each person a voice. Check it in Edit the Khmer first.') }}</small></span>
                 </label>
                 <label class="toggle">
                     <input type="checkbox" name="review" value="1" @checked($errors->any() ? old('review') : $options['review'])><i></i>
@@ -205,6 +210,9 @@
     </div>
 
     <x-slot name="scripts">
+    @if ($live)
+        <script src="{{ asset('js/live.js') }}"></script>
+    @endif
     <script>
     (() => {
         const STATUS = @json($statusLabel);
@@ -251,6 +259,8 @@
             $('original-sound').classList.toggle('off', !dub.checked);
             form.elements.separate.disabled = !dub.checked;
             $('separate-row').classList.toggle('off', !dub.checked);
+            form.elements.speakers.disabled = !dub.checked;
+            $('speakers-row').classList.toggle('off', !dub.checked);
         }
 
         /** Without speech, the original sound is music and effects: turn it up if it was off, or there is nothing to hear. */
@@ -303,7 +313,7 @@
             $('job-count').textContent = '';
             if (toggle.disabled) return foldSteps(false);
 
-            const steps = STEPS.filter((step) => (job.dub !== false || !step.voice) && (step.separate ?? Boolean(job.separate)) === Boolean(job.separate));
+            const steps = STEPS.filter((step) => (job.dub !== false || !step.voice) && (!step.speakers || Boolean(job.speakers)) && (step.separate ?? Boolean(job.separate)) === Boolean(job.separate));
             if (list.children.length !== steps.length) {
                 list.replaceChildren(...steps.map((step) => Object.assign(document.createElement('li'), { textContent: step.label })));
             }
@@ -570,7 +580,12 @@
             if (link.classList.contains('play')) $('job-player').play().catch(() => {}); // a browser may refuse; its own button still works
         });
 
-        /** Ask for the job's status every 3 seconds until it stops. */
+        // live: Reverb sends the progress of this user's jobs (public/js/live.js), so a running job is
+        // not asked for. Without a word from it for QUIET_MS, the page asks once, in case one was missed.
+        const LIVE = @json($live), MESSAGES = @json($liveMessages), QUIET_MS = 30000;
+        let live = false;
+
+        /** Ask for the job's status every 3 seconds until it stops, or only now and then while live. */
         async function poll(url) {
             clearTimeout(timer);
             try {
@@ -584,10 +599,30 @@
                 const job = await response.json();
                 render(job);
                 if (stopped(job.status)) return;
+                // Only while it runs: a waiting job's place in the queue moves with other people's videos.
+                if (live && job.status === 'processing') return void (timer = setTimeout(() => poll(url), QUIET_MS));
             } catch (error) {
                 $('job-message').textContent = TEXT.lostContact;
             }
             timer = setTimeout(() => poll(url), POLL_MS);
+        }
+
+        /** A job of this user changed. A running job's progress is drawn as it comes; anything else asks for the status once. */
+        function liveUpdate(name, job) {
+            if (name !== 'job.updated' || !shown?.status_url || shown.id !== job.id) return;
+            if (job.status !== 'processing' || job.cancelling) return poll(shown.status_url); // its links and reasons come with the status
+            render({
+                ...shown, status: job.status, progress: job.progress, step_done: job.step_done, step_total: job.step_total,
+                ahead: null, message: MESSAGES[job.message] ?? job.message,
+            });
+            clearTimeout(timer);
+            timer = setTimeout(() => poll(shown.status_url), QUIET_MS);
+        }
+
+        /** Reverb came or went. Without it, a running job is asked for every 3 seconds again. */
+        function liveState(on) {
+            live = on;
+            if (!on && shown?.status_url && !stopped(shown.status)) poll(shown.status_url);
         }
 
         $('job-close').addEventListener('click', closeJob);
@@ -740,6 +775,7 @@
             const arrived = performance.getEntriesByType('navigation')[0]?.type === 'navigate';
             if (arrived && new URLSearchParams(location.search).has('job')) showJob();
         }
+        if (LIVE && window.KhmerLive) KhmerLive.connect(LIVE, liveUpdate, liveState);
     })();
     </script>
     </x-slot>

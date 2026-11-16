@@ -418,3 +418,33 @@ tr.closing { animation: vanish .2s ease both; }
 .langs button[aria-pressed=true] { background: var(--sun); color: #2a1e6b; }
 .welcome-form { position: relative; }
 .welcome-form .langs { position: absolute; top: 1.25rem; right: 1.25rem; }
+
+/* Review page: the speakers a job found, and each line's speaker. */
+.speakers { margin-top: 1.25rem; padding: 1rem 1.5rem; }
+.speakers h2 { margin: 0 0 .25rem; }
+.speaker { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.25rem; border: 0; border-top: 2px solid var(--line); margin: .5rem 0 0; padding: .75rem 0 0; }
+.speaker legend { float: left; min-width: 9rem; padding: 0; font-weight: 700; }
+.speaker label { margin: 0; font-weight: 400; cursor: pointer; }
+.speaker-pick { grid-column: 2; justify-self: start; width: auto; padding: .2rem .5rem; font-size: .9rem; }
+.speaker legend::before, .speaker-pick { border-left: 6px solid var(--speaker, var(--line)); }
+.speaker legend::before { content: ""; margin-right: .5rem; }
+[data-speaker="0"] { --speaker: #d81b72; }
+[data-speaker="1"] { --speaker: #007f6d; }
+[data-speaker="2"] { --speaker: #ffc21a; }
+[data-speaker="3"] { --speaker: #5b6ee1; }
+[data-speaker="4"] { --speaker: #e8733a; }
+[data-speaker="5"] { --speaker: #8a5cc8; }
+
+/* Top bar link to the glossary, and the review page's note on a line from the memory of edits. */
+.glossary-link { color: var(--ink); font-weight: 600; text-decoration: none; }
+.glossary-link:hover { color: var(--lotus); }
+.line .reused { margin: .25rem 0 0; color: var(--jade); }
+#glossary { width: 100%; font-family: inherit; }
+
+/* Review page: hear one line's Khmer voice before saving. */
+.line-tools { display: flex; flex-wrap: wrap; align-items: baseline; gap: .25rem .75rem; }
+.line-tools .fit { flex: 1 1 12rem; }
+.listen-line { padding: .2rem .7rem; font-size: .875rem; box-shadow: none; background: var(--well); color: var(--ink); }
+.listen-line:hover { background: var(--well); color: var(--lotus); transform: none; }
+.listen-line.playing { background: var(--lotus); color: var(--lotus-ink); }
+.listen-line.busy { opacity: .6; cursor: progress; }

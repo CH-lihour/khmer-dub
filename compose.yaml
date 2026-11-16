@@ -14,6 +14,12 @@ x-mail: &mail
   MAIL_HOST: mailpit
   MAIL_PORT: "1025"
 
+# The site sends live progress to Reverb inside Docker; the browser reaches it on port 8080.
+x-reverb: &reverb
+  REVERB_HOST: reverb
+  REVERB_PORT: "8080"
+  REVERB_SCHEME: http
+
 services:
   web:
     build: *web-build
@@ -26,7 +32,7 @@ services:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
       PHP_CLI_SERVER_WORKERS: "4"
-      <<: *mail
+      <<: [*mail, *reverb]
     volumes:
       - ./web:/var/www/html
     ports:
@@ -60,7 +66,7 @@ services:
     environment:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
-      <<: *mail
+      <<: [*mail, *reverb]
     volumes:
       - ./web:/var/www/html
     depends_on:
@@ -89,7 +95,7 @@ services:
     environment:
       DB_HOST: mysql
       DUBBER_URL: http://worker:8001
-      <<: *mail
+      <<: [*mail, *reverb]
     volumes:
       - ./web:/var/www/html
     depends_on:
@@ -103,6 +109,31 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
+
+  # Live progress for the page (Laravel Reverb, MIT). Optional: when it is stopped, the page
+  # asks for the status every 3 seconds instead. Port 8080 is published to 127.0.0.1 only.
+  reverb:
+    build: *web-build
+    image: khmer-dub-web:dev
+    command: ["php", "artisan", "reverb:start", "--host=0.0.0.0", "--port=8080"]
+    env_file: ./web/.env
+    environment:
+      DB_HOST: mysql
+      <<: *reverb
+    volumes:
+      - ./web:/var/www/html
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/up"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
 
   mysql:

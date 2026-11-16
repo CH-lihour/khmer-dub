@@ -1,10 +1,13 @@
 """HTTP endpoints of the dubbing worker, exactly as in the API contract of CLAUDE.md.
 
-    POST /jobs                       multipart file, gender, dub, review, original_volume -> {"job_id": "<hex>"}
+    POST /jobs                       multipart file, gender, dub, review, original_volume, language, separate,
+                                     speakers -> {"job_id": "<hex>"}
     GET  /jobs/{id}                  -> {"status", "progress", "message", "error", "language", "done", "total"}
-    GET  /jobs/{id}/segments         -> {"segments": [...]}, while the job is in review or done
-    PUT  /jobs/{id}/segments         JSON {"segments": [{"id", "km"}], "gender", "original_volume"}
+    GET  /jobs/{id}/segments         -> {"segments": [...], "speakers": [...]}, while the job is in review or done
+    PUT  /jobs/{id}/segments         JSON {"segments": [{"id", "km", "speaker"}], "gender", "original_volume",
+                                     "speakers": [{"id", "gender"}]}
                                      -> saves the Khmer and the choices, and resumes
+    POST /jobs/{id}/voice            JSON {"text", "gender", "speaker", "speakers"} -> one line's Khmer voice as WAV
     POST /jobs/{id}/reopen           multipart file (the original video) -> puts a done job back in review
     POST /jobs/{id}/cancel           -> {"status": ...}, stops a queued or running job
     DELETE /jobs/{id}                -> {"status": "deleted"}, deletes a stopped job and its folder
@@ -30,6 +33,7 @@ import re
 import secrets
 import shutil
 import threading
+import wave
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -40,7 +44,7 @@ from typing import Annotated
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 import config
 import pipeline
@@ -69,13 +73,41 @@ NO_LINES = "This job has no saved lines to edit. Please upload the video again."
 NOT_RUNNING = "This job is not queued or running, so there is nothing to cancel."
 STILL_RUNNING = "This job is still queued or running. Cancel it first."
 MAX_LINE_CHARS = 2000
+TERMS_FILE = "terms.json"  # the job's glossary and memory of edits, until its Khmer is ready
 
 
 class EditedLine(BaseModel):
-    """One reviewed line: the segment's id and its Khmer text. Empty text drops the line."""
+    """One reviewed line: the segment's id, its Khmer text and, optionally, who says it. Empty text drops the line."""
 
     id: int
     km: str = Field(max_length=MAX_LINE_CHARS)
+    speaker: int | None = None
+
+
+class GlossaryEntry(BaseModel):
+    """A term to keep as written (empty `km`) or to put in the given Khmer."""
+
+    term: str = Field(min_length=1, max_length=100)
+    km: str = Field(default="", max_length=200)
+
+
+class Remembered(BaseModel):
+    """Khmer a person wrote for a line before, in a video spoken in `language`."""
+
+    language: str = Field(max_length=8)
+    text: str = Field(max_length=MAX_LINE_CHARS)
+    km: str = Field(max_length=MAX_LINE_CHARS)
+
+
+GLOSSARY = TypeAdapter(list[GlossaryEntry])
+MEMORY = TypeAdapter(list[Remembered])
+
+
+class SpeakerVoice(BaseModel):
+    """The voice chosen for one speaker of a job sent with speakers=true."""
+
+    id: int
+    gender: str
 
 
 class Edits(BaseModel):
@@ -84,6 +116,16 @@ class Edits(BaseModel):
     segments: list[EditedLine]
     gender: str | None = None
     original_volume: float | None = Field(default=None, ge=0, le=1)
+    speakers: list[SpeakerVoice] | None = None
+
+
+class LineVoice(BaseModel):
+    """The body of POST /jobs/{id}/voice: one line's Khmer, and the voice choices not saved yet."""
+
+    text: str = Field(min_length=1, max_length=MAX_LINE_CHARS)
+    gender: str | None = None
+    speaker: int | None = None
+    speakers: list[SpeakerVoice] | None = None
 
 
 class Cancelled(Exception):
@@ -110,7 +152,8 @@ class JobStore:
         return job_id, folder
 
     def submit(self, job_id: str, upload: str, gender: str, dub: bool, review: bool = False,
-               original_volume: float | None = None, spoken: str | None = None, separate: bool = False) -> None:
+               original_volume: float | None = None, spoken: str | None = None, separate: bool = False,
+               speakers: bool = False) -> None:
         """Record a new job as queued and put it in line for the worker thread.
 
         `spoken` is the spoken language the user chose (None: detect it). "language" stays null
@@ -118,7 +161,8 @@ class JobStore:
         """
         job = {"status": "queued", "progress": 0, "message": "Waiting in the queue", "error": None,
                "language": None, "upload": upload, "gender": gender, "dub": dub, "review": review,
-               "original_volume": original_volume, "spoken": spoken, "separate": separate, "created": _now()}
+               "original_volume": original_volume, "spoken": spoken, "separate": separate,
+               "speakers": speakers, "created": _now()}
         with self._lock:
             self._jobs[job_id] = job
         self.update(job_id)
@@ -138,20 +182,31 @@ class JobStore:
     def resume(self, job_id: str, edits: Edits) -> None:
         """Save the reviewed Khmer and choices of a job in review and put it in line to make the results.
 
-        Answers 422 for a line id the job does not have, an unknown voice, or if every line would be
-        empty, and 409 if the job is not (or no longer) waiting for review, so saving twice cannot
-        run it twice.
+        Answers 422 for a line id or speaker the job does not have, an unknown voice, or if every
+        line would be empty, and 409 if the job is not (or no longer) waiting for review, so saving
+        twice cannot run it twice.
         """
         if edits.gender is not None and edits.gender not in VOICES:
             raise HTTPException(422, "gender must be female or male.")
         folder = self.work_dir / job_id
-        segments = pipeline.load_segments(folder)
+        segments, speakers = pipeline.load_segments(folder), pipeline.load_speakers(folder)
         changed = {line.id: line.km.strip() for line in edits.segments}
         unknown = changed.keys() - {seg["id"] for seg in segments}
         if unknown:
             raise HTTPException(422, f"These lines are not part of this job: {sorted(unknown)}.")
+        speaker_ids = {speaker["id"] for speaker in speakers}
+        moved = {line.id: line.speaker for line in edits.segments if line.speaker is not None}
+        voices = {voice.id: voice.gender for voice in edits.speakers or []}
+        if (moved.values() | voices.keys()) - speaker_ids:
+            raise HTTPException(422, f"These speakers are not part of this job: {sorted((moved.values() | voices.keys()) - speaker_ids)}.")
+        if any(gender not in VOICES for gender in voices.values()):
+            raise HTTPException(422, "A speaker's gender must be female or male.")
         for seg in segments:
             seg["km"] = changed.get(seg["id"], seg["km"])
+            seg["speaker"] = moved.get(seg["id"], seg.get("speaker"))
+        for speaker in speakers:
+            speaker["gender"] = voices.get(speaker["id"], speaker["gender"])
+            speaker["lines"] = sum(seg.get("speaker") == speaker["id"] for seg in segments)
         if not any(seg["km"] for seg in segments):
             raise HTTPException(422, "Every line is empty. Keep the Khmer text of at least one line.")
         foreign = [seg["id"] + 1 for seg in segments if has_other_script_only(seg["km"])]
@@ -162,6 +217,8 @@ class JobStore:
             if self._jobs[job_id]["status"] != "review":
                 raise HTTPException(409, NOT_IN_REVIEW)
             pipeline.save_segments(folder, segments)
+            if speakers:
+                pipeline.save_speakers(folder, speakers)
             choices = {"gender": edits.gender, "original_volume": edits.original_volume}
             self._set(job_id, status="queued", message="Waiting in the queue", error=None, restarts=0,
                       **{key: value for key, value in choices.items() if value is not None})
@@ -228,16 +285,19 @@ class JobStore:
         video, progress = folder / job["upload"], self._reporter(job_id)
         log.info("Job %s started (voice %s, dub %s, review %s)", job_id, job["gender"], job["dub"], job.get("review"))
 
+        terms = _read_terms(folder)
+
         def work() -> None:
             if job.get("review"):
-                prepared = pipeline.prepare(folder, video, progress, job.get("spoken"))
+                prepared = pipeline.prepare(folder, video, progress, job.get("spoken"), job.get("speakers", False), **terms)
                 self.update(job_id, status="review", progress=REVIEW_PROGRESS, message=REVIEW_MESSAGE, done=None, total=None,
                             restarts=0, **prepared)
             else:
                 # Translated before a restart: "prepared" lets it go on from the voice.
                 result = pipeline.run(folder, video, job["gender"], job["dub"], progress, job.get("original_volume"),
                                       prepared=job.get("prepared"), on_prepared=lambda done: self.update(job_id, prepared=done),
-                                      language=job.get("spoken"), separate=job.get("separate", False))
+                                      language=job.get("spoken"), separate=job.get("separate", False),
+                                      speakers=job.get("speakers", False), **terms)
                 self._done(job_id, job["upload"], result)
 
         self._attempt(job_id, work)
@@ -391,6 +451,9 @@ def create_job(
     original_volume: Annotated[float | None, Form(ge=0, le=1)] = None,
     language: Annotated[str, Form()] = "",
     separate: Annotated[str, Form()] = "false",
+    speakers: Annotated[str, Form()] = "false",
+    glossary: Annotated[str, Form()] = "",
+    memory: Annotated[str, Form()] = "",
 ) -> dict[str, str]:
     """Save the uploaded video, check it, queue it, and return {"job_id": "<hex>"}.
 
@@ -399,15 +462,21 @@ def create_job(
     `original_volume` is how loud the original sound plays under the voice, 0 to 1 (default
     ORIGINAL_VOLUME). `language` is the spoken language as a Whisper code (empty: detect it), and
     `separate` is true to take the speech out of the original sound, keeping music and effects
-    (default false). Answers 422 with a clear `detail` for a missing file, an unsupported or
-    unreadable format, a video without sound or one longer than MAX_VIDEO_MINUTES.
+    (default false). `speakers` is true to find who speaks each line and give each speaker a voice
+    of their own (default false). `glossary` is JSON [{"term", "km"}], terms to keep or to put in
+    the given Khmer, and `memory` JSON [{"language", "text", "km"}], Khmer a person wrote for a line
+    before, to reuse for the same line (both optional). Answers 422 with a clear `detail` for a missing file, an
+    unsupported or unreadable format, a video without sound or one longer than MAX_VIDEO_MINUTES.
     """
     gender, dub, review = gender.strip().lower(), dub.strip().lower(), review.strip().lower()
-    language, separate = language.strip().lower(), separate.strip().lower()
+    language, separate, speakers = language.strip().lower(), separate.strip().lower(), speakers.strip().lower()
     if language and language not in SPOKEN_LANGUAGES:
         raise HTTPException(422, "language must be a Whisper language code that can be translated to Khmer, or empty.")
     if separate not in DUB_VALUES:
         raise HTTPException(422, "separate must be true or false.")
+    if speakers not in DUB_VALUES:
+        raise HTTPException(422, "speakers must be true or false.")
+    terms = {"glossary": _parse(GLOSSARY, glossary, "glossary", 500), "memory": _parse(MEMORY, memory, "memory", 5000)}
     if file is None or not file.filename:
         raise HTTPException(422, "No video was sent. Attach it as the multipart field 'file'.")
     extension = Path(file.filename).suffix.lower()
@@ -435,9 +504,12 @@ def create_job(
         log.exception("Could not save the upload of job %s", job_id)
         raise HTTPException(500, "The worker could not save the video. Check its free disk space.") from exc
 
-    log.info("Job %s queued: %s, %.1f MB", job_id, extension, upload.stat().st_size / 1e6)
+    if terms["glossary"] or terms["memory"]:
+        _write_json(folder / TERMS_FILE, terms)
+    log.info("Job %s queued: %s, %.1f MB, %d glossary terms, %d remembered lines", job_id, extension,
+             upload.stat().st_size / 1e6, len(terms["glossary"]), len(terms["memory"]))
     jobs.submit(job_id, upload.name, gender, DUB_VALUES[dub], DUB_VALUES[review], original_volume,
-                language or None, DUB_VALUES[separate])  # it may delete the upload from here on
+                language or None, DUB_VALUES[separate], DUB_VALUES[speakers])  # it may delete the upload from here on
     return {"job_id": job_id}
 
 
@@ -464,14 +536,21 @@ def delete_job(job_id: str, request: Request) -> dict[str, str]:
 
 @app.get("/jobs/{job_id}/segments")
 def job_segments(job_id: str, request: Request) -> dict[str, list[dict]]:
-    """Return the lines of a job in review or done: {"segments": [{id, start, end, text, km}]}. Else 409."""
+    """Return the lines of a job in review or done. Else 409.
+
+    {"segments": [{id, start, end, text, km, speaker, reused}], "speakers": [{id, gender, lines}]}, where
+    `speaker` is null and `speakers` empty for a job sent without speakers=true, and `reused` is true
+    for a line whose Khmer came from the memory of edits.
+    """
     if _find(request, job_id)["status"] not in ("review", "done"):
         raise HTTPException(409, NOT_IN_REVIEW)
     folder = request.app.state.jobs.work_dir / job_id
     if not (folder / "segments.json").is_file():
         raise HTTPException(409, NO_LINES)
     fields = ("id", "start", "end", "text", "km")
-    return {"segments": [{key: seg[key] for key in fields} for seg in pipeline.load_segments(folder)]}
+    segments = [{**{key: seg[key] for key in fields}, "speaker": seg.get("speaker"), "reused": seg.get("reused", False)}
+                for seg in pipeline.load_segments(folder)]
+    return {"segments": segments, "speakers": pipeline.load_speakers(folder)}
 
 
 @app.put("/jobs/{job_id}/segments")
@@ -481,6 +560,38 @@ def save_segments(job_id: str, edits: Edits, request: Request) -> dict[str, str]
         raise HTTPException(409, NOT_IN_REVIEW)
     request.app.state.jobs.resume(job_id, edits)
     return {"status": "queued"}
+
+
+_voice_lock = threading.Lock()  # one line at a time, so two clicks on the same line never write one clip twice
+
+
+@app.post("/jobs/{job_id}/voice")
+def line_voice(job_id: str, body: LineVoice, request: Request) -> FileResponse:
+    """Make the Khmer voice of one line, to hear it before saving, and send it as a WAV.
+
+    The voice is the job's (or `gender`), or with `speaker` that speaker's, with `speakers` as chosen
+    on the review page. The header x-clip-seconds says how long it is. The clip is kept, so saving
+    the same line uses it instead of making it again. Answers 409 unless the job is a dubbed one in
+    review or done, 422 for a line the voice cannot read, and 503 if the voice service is down.
+    """
+    job = _find(request, job_id)
+    if job["status"] not in ("review", "done") or not job.get("dub"):
+        raise HTTPException(409, "Only a dubbed video that is waiting for review or done can play a line's voice.")
+    gender = body.gender or job["gender"]
+    voices = {voice.id: voice.gender for voice in body.speakers or []}
+    if gender not in VOICES or any(choice not in VOICES for choice in voices.values()):
+        raise HTTPException(422, "gender must be female or male.")
+    text = body.text.strip()
+    if not any(ch.isalnum() for ch in text) or has_other_script_only(text):
+        raise HTTPException(422, "This line has no Khmer text to say.")
+    try:
+        with _voice_lock:
+            clip = pipeline.line_voice(request.app.state.jobs.work_dir / job_id, text, gender, body.speaker, voices)
+    except StageError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    with wave.open(str(clip), "rb") as wav:
+        seconds = wav.getnframes() / wav.getframerate()
+    return FileResponse(clip, media_type="audio/wav", headers={"x-clip-seconds": f"{seconds:.2f}", "cache-control": "no-store"})
 
 
 @app.post("/jobs/{job_id}/reopen")
@@ -593,10 +704,33 @@ def _save(file: UploadFile, path: Path) -> None:
 
 
 def _tidy(folder: Path, upload: str) -> None:
-    """Delete the upload and the working files of a finished job; keep the results and status.json."""
-    for name in (upload, "audio.wav", "dub.wav"):
+    """Delete the upload and the working files of a finished job; keep the results and status.json.
+
+    The voice clips stay, so editing the job later only voices the lines that changed.
+    """
+    for name in (upload, "audio.wav", "dub.wav", TERMS_FILE):
         (folder / name).unlink(missing_ok=True)
-    shutil.rmtree(folder / "clips", ignore_errors=True)
+
+
+def _parse(adapter: TypeAdapter, value: str, field: str, limit: int) -> list[dict]:
+    """Read a JSON list form field (empty: none), or answer 422 with what is wrong."""
+    if not value.strip():
+        return []
+    try:
+        items = adapter.validate_json(value)
+    except ValidationError as exc:
+        raise HTTPException(422, f"{field} must be a JSON list as in the API contract: {exc.errors()[0]['msg']}.") from exc
+    if len(items) > limit:
+        raise HTTPException(422, f"{field} can have at most {limit} entries.")
+    return [item.model_dump() for item in items]
+
+
+def _read_terms(folder: Path) -> dict[str, list[dict]]:
+    """The glossary and memory sent with a job, or none."""
+    try:
+        return json.loads((folder / TERMS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"glossary": [], "memory": []}
 
 
 def _write_json(path: Path, data: dict) -> None:

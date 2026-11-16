@@ -20,6 +20,8 @@ MODEL_NAME = "facebook/nllb-200-distilled-600M"
 TARGET = "khm_Khmr"
 BATCH_SIZE = 12
 MAX_TOKENS = 256
+MAX_GLOSSARY = 500
+MAX_MEMORY = 5000
 ALREADY_KHMER = "This video seems to be in Khmer already, so there is nothing to translate. Upload a video in another language."
 NO_KHMER = "The translation did not produce any Khmer text. Try a video with clearer speech."
 
@@ -49,14 +51,19 @@ WHISPER_TO_NLLB: dict[str, str] = {
 }
 
 
-def translate(segments: list[dict], src_lang: str, on_step: Callable[[int, int], None] | None = None) -> list[dict]:
+def translate(segments: list[dict], src_lang: str, on_step: Callable[[int, int], None] | None = None,
+              glossary: list[dict] | None = None, memory: list[dict] | None = None) -> list[dict]:
     """Fill `km` with the Khmer translation of `text` for every segment and return the segments.
 
     `src_lang` is the Whisper language code. Khmer sources are copied without loading the model, but
     only lines really written in Khmer: Whisper knows when speech is Khmer, yet writes it as garbage
-    in other scripts. `on_step(done, total)` reports the lines translated so far. Raises StageError
-    if that leaves nothing, if no line came out in Khmer, for a language NLLB-200 does not cover, or
-    if the model cannot be loaded.
+    in other scripts. `on_step(done, total)` reports the lines translated so far.
+
+    `glossary` is [{"term", "km"}]: each term found in a line comes out as its `km`, or as the term
+    itself when `km` is empty (a name to keep). `memory` is [{"language", "text", "km"}], Khmer a
+    person wrote for a line before: a line with the same text in the same language gets that Khmer
+    without the model, and `reused` set. Raises StageError if that leaves nothing, if no line came
+    out in Khmer, for a language NLLB-200 does not cover, or if the model cannot be loaded.
     """
     if src_lang == "km":
         for seg in segments:
@@ -69,19 +76,105 @@ def translate(segments: list[dict], src_lang: str, on_step: Callable[[int, int],
     if src_code is None:
         raise StageError(f"Translating from this language ('{src_lang}') to Khmer is not supported.")
 
-    todo = [seg for seg in segments if seg["text"].strip()]
+    remembered = {memory_key(entry["text"]): entry["km"].strip() for entry in (memory or [])[-MAX_MEMORY:]
+                  if entry.get("language") == src_lang and entry.get("km", "").strip()}
+    terms = Glossary(glossary or [])
+    todo = []
     for seg in segments:
         seg["km"] = ""
+        seg.pop("reused", None)
+        if not seg["text"].strip():
+            continue
+        if memory_key(seg["text"]) in remembered:
+            seg["km"], seg["reused"] = remembered[memory_key(seg["text"])], True
+        else:
+            todo.append(seg)
     for start in range(0, len(todo), BATCH_SIZE):
-        batch = todo[start:start + BATCH_SIZE]
-        for seg, km in zip(batch, _translate_batch([seg["text"] for seg in batch], src_code), strict=True):
-            seg["km"] = join_khmer_words(km.strip()) if config.KHMER_SPACES == "remove" else km.strip()
+        _translate_lines(todo[start:start + BATCH_SIZE], src_code, terms)
         if on_step:
             on_step(min(start + BATCH_SIZE, len(todo)), len(todo))
     if not any(is_khmer(seg["km"]) for seg in segments):
         raise StageError(NO_KHMER)
-    log.info("Translated %d segments from %s to %s", len(todo), src_code, TARGET)
+    log.info("Translated %d segments from %s to %s; %d from memory", len(todo), src_code, TARGET,
+             sum(bool(seg.get("reused")) for seg in segments))
     return segments
+
+
+def memory_key(text: str) -> str:
+    """How a line is looked up in the memory of edits: case, spacing and the final punctuation do not count."""
+    return " ".join(text.casefold().split()).rstrip(" .,!?;:…。！？")
+
+
+class Glossary:
+    """Terms to keep or to put in a given Khmer, found in a line whatever their case.
+
+    A term is only found as a whole word where it starts or ends with a letter or digit, so "Sok"
+    is not found inside "Sokha". The longest term wins where two overlap.
+    """
+
+    def __init__(self, entries: list[dict]) -> None:
+        self.khmer: dict[str, str] = {}
+        for entry in entries[:MAX_GLOSSARY]:
+            term = " ".join(entry.get("term", "").split())
+            if term:
+                self.khmer[term.casefold()] = entry.get("km", "").strip() or term
+        parts = [(r"(?<!\w)" if term[0].isalnum() else "") + re.escape(term).replace(r"\ ", r"\s+") + (r"(?!\w)" if term[-1].isalnum() else "")
+                 for term in sorted(self.khmer, key=len, reverse=True)]
+        self.pattern = re.compile("|".join(parts), re.IGNORECASE) if parts else None
+
+    def protect(self, text: str) -> tuple[str, list[str]]:
+        """Return `text` with each term replaced by a marker [1], [2], ... and the Khmer for each marker."""
+        if self.pattern is None:
+            return text, []
+        found: list[str] = []
+
+        def mark(match: re.Match) -> str:
+            found.append(self.khmer.get(" ".join(match.group(0).casefold().split()), match.group(0)))
+            return f"[{len(found)}]"
+
+        return self.pattern.sub(mark, text), found
+
+    @staticmethod
+    def restore(km: str, found: list[str]) -> str | None:
+        """Put the Khmer of each term back in place of its marker, or None if NLLB lost or doubled one."""
+        numbers = [int(n.translate(_KHMER_DIGITS)) for n in _MARKER.findall(km)]
+        if sorted(numbers) != list(range(1, len(found) + 1)):
+            return None
+        return _MARKER.sub(lambda m: found[int(m.group(1).translate(_KHMER_DIGITS)) - 1], km)
+
+
+_MARKER = re.compile(r"\[\s*([0-9០-៩]+)\s*\]")
+_KHMER_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+
+
+def _translate_lines(batch: list[dict], src_code: str, terms: Glossary) -> None:
+    """Translate one batch of segments, with the glossary's terms kept out of NLLB's reach.
+
+    A line whose markers NLLB lost is translated again without them, so it still gets its Khmer.
+    """
+    marked = [terms.protect(seg["text"]) for seg in batch]
+    results = _translate_batch([text for text, _ in marked], src_code)
+    lost = []
+    for seg, (_, found), km in zip(batch, marked, results, strict=True):
+        km = _tidy(km)
+        if found:
+            restored = Glossary.restore(km, found)
+            if restored is None:
+                lost.append(seg)
+                continue
+            # With markers in it, NLLB often ends a line with a Latin full stop instead of the Khmer one.
+            km = re.sub(r"\s*\.$", "។", restored) if is_khmer(restored) else restored
+        seg["km"] = km
+    if lost:
+        log.warning("The glossary markers were lost in %d lines; translating them without the glossary", len(lost))
+        for seg, km in zip(lost, _translate_batch([seg["text"] for seg in lost], src_code), strict=True):
+            seg["km"] = _tidy(km)
+
+
+def _tidy(km: str) -> str:
+    """NLLB's output, trimmed, with the spaces between Khmer words removed if KHMER_SPACES=remove."""
+    km = km.strip()
+    return join_khmer_words(km) if config.KHMER_SPACES == "remove" else km
 
 
 # A Khmer letter or sign (U+1780 to U+17D3, and U+17DD), not punctuation (។ ៖ ...) or a digit.
